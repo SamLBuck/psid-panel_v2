@@ -1,0 +1,414 @@
+---
+title: "Does religiosity buffer the negative effect of moving on giving?"
+output: html_document
+---
+
+```{r setup, message=FALSE}
+# Research design:
+#   - Panel of PSID families (2001-2021, biennial)
+#   - Outcome: total charitable giving (sum of donation categories)
+#   - Treatment: moved (binary, from "WHY MOVED" reason codes)
+#   - Moderator: religious (binary, Religious_Preference != 0/97/98/99)
+#   - Model: family fixed effects with moved x religious interaction
+#   - Family FE absorbs time-invariant family characteristics
+#   - Wave FE absorbs macro trends in giving
+#
+# NOTE: We use id_1968 (1968 Family Identifier) as the longitudinal key
+# to track the same family lineage across waves. The Interview Number
+# (family_id) is only unique within a wave and gets recycled.
+# Splitoffs are deduplicated by keeping the oldest head per lineage.
+
+library(tidyverse)
+library(arrow)
+library(fixest)
+library(here)
+```
+
+```{r load_and_derive}
+# ---- 1. Load the family-level panel ----
+panel <- read_parquet(here("output", "psid_family_year_2001_latest.parquet"))
+
+cat("Raw panel:", nrow(panel), "rows,", ncol(panel), "columns\n")
+cat("Waves:", paste(sort(unique(panel$wave)), collapse = ", "), "\n")
+cat("Unique id_1968 (lineages):", n_distinct(panel$id_1968), "\n\n")
+
+# ---- 2. Derive key variables ----
+
+# 2a. Total giving: sum available dollar-amount donation columns
+donation_cols <- c(
+  "DOLLAR AMT OF RELIGIOUS DONATIONS",
+  "DOLLAR AMT OF NEEDY DONATIONS",
+  "DOLLAR AMT OF HEALTH DONATIONS",
+  "DOLLAR AMT OF EDUCATION DONATIONS"
+)
+available_donation_cols <- donation_cols[donation_cols %in% names(panel)]
+cat("Donation columns found:", length(available_donation_cols), "\n")
+cat("  ", paste(available_donation_cols, collapse = "\n   "), "\n\n")
+
+# 2b. Build analysis dataset
+#     First, clean PSID sentinel codes from dollar amounts:
+#     999997 = "Other", 999998 = "Don't Know", 999999 = "NA/Refused"
+analysis <- panel |>
+  mutate(
+    across(
+      all_of(available_donation_cols),
+      ~ if_else(.x >= 999997, NA_real_, .x)
+    )
+  ) |>
+  mutate(
+    # --- Outcome: total giving ---
+    total_giving = rowSums(
+      across(all_of(available_donation_cols),
+             ~ replace_na(pmax(.x, 0), 0)),
+      na.rm = TRUE
+    ),
+    log_giving = log1p(total_giving),
+
+    # --- Treatment: whether the family moved since last wave ---
+    #     "WHY MOVED 1ST" coded 0 = did not move; 1-9 = reason
+    #     97/98/99 are sentinel codes (Other/DK/Refused) — treat
+    #     as NA because we can't confirm a move actually occurred
+    moved = case_when(
+      is.na(`WHY MOVED 1ST`) ~ 0L,
+      `WHY MOVED 1ST` >= 97 ~ NA_integer_,
+      `WHY MOVED 1ST` > 0 ~ 1L,
+      TRUE ~ 0L
+    ),
+
+    # --- Moderator: religious affiliation ---
+    #     PSID codes: 0 = none, 1-13 = denominations,
+    #                 97 = other, 98 = DK, 99 = NA/refused
+    religious = case_when(
+      is.na(Religious_Preference) ~ NA_integer_,
+      Religious_Preference %in% c(0, 97, 98, 99) ~ 0L,
+      TRUE ~ 1L
+    ),
+
+    # --- Controls ---
+    age = as.numeric(head_age),
+    age2 = age^2
+  ) |>
+  select(
+    id_1968, family_id, wave, interview_year,
+    total_giving, log_giving,
+    moved, religious,
+    Religious_Preference,
+    age, age2,
+    `Current State`,
+    any_of("n_children_u18")
+  ) |>
+  filter(!is.na(id_1968), !is.na(religious))
+
+# --- Splitoff dedup: keep main family per lineage per wave ---
+n_pre <- nrow(analysis)
+analysis <- analysis |>
+  group_by(id_1968, wave) |>
+  slice_max(age, n = 1, with_ties = FALSE) |>
+  ungroup()
+cat("Splitoff dedup: kept", nrow(analysis), "of", n_pre, "rows\n")
+
+# --- Lagged religiosity (pre-move moderator) ---
+analysis <- analysis |>
+  arrange(id_1968, wave) |>
+  group_by(id_1968) |>
+  mutate(religious_lag = lag(religious, order_by = wave)) |>
+  ungroup()
+
+cat("\nAnalysis dataset:", nrow(analysis),
+    "family-wave observations\n")
+cat("Unique id_1968 lineages:",
+    n_distinct(analysis$id_1968), "\n")
+cat("Movers:", sum(analysis$moved == 1, na.rm = TRUE), "(",
+    round(100 * mean(analysis$moved == 1, na.rm = TRUE), 1),
+    "%)\n")
+cat("Religious:", sum(analysis$religious == 1), "(",
+    round(100 * mean(analysis$religious == 1), 1), "%)\n")
+cat("Religious (lagged, non-NA):",
+    sum(!is.na(analysis$religious_lag)), "\n\n")
+```
+
+```{r descriptives}
+# ---- 3. Descriptive statistics ----
+# Using LAGGED religiosity (pre-move status)
+desc_table <- analysis |>
+  filter(!is.na(religious_lag), !is.na(moved)) |>
+  group_by(moved, religious_lag) |>
+  summarise(
+    n = n(),
+    mean_giving = mean(total_giving, na.rm = TRUE),
+    median_giving = median(total_giving, na.rm = TRUE),
+    mean_log_giving = mean(log_giving, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+cat("Mean giving by move status x PRE-MOVE religiosity:\n")
+print(desc_table)
+```
+
+```{r models}
+# ---- 4. Fixed effects regression ----
+# id_1968 FE absorbs time-invariant family characteristics
+# wave FE absorbs macro trends in giving
+# religious_lag = religiosity from the PRIOR wave (pre-move)
+#   — avoids endogeneity from moving changing religious ID
+
+# Subset with non-missing lagged religiosity
+analysis_lag <- analysis |>
+  filter(!is.na(religious_lag), !is.na(moved))
+
+cat("Lagged-religion sample:", nrow(analysis_lag),
+    "obs (first wave of each family dropped)\n\n")
+
+# Model 1: Does moving reduce giving?
+m1 <- feols(log_giving ~ moved | id_1968 + wave,
+            data = analysis_lag)
+
+# Model 2: Does PRE-MOVE religiosity moderate the effect?
+m2 <- feols(
+  log_giving ~ moved * religious_lag | id_1968 + wave,
+  data = analysis_lag
+)
+
+# Model 3: Add age controls
+m3 <- feols(
+  log_giving ~ moved * religious_lag + age + age2 |
+    id_1968 + wave,
+  data = analysis_lag
+)
+
+# Cluster standard errors by family
+etable(m1, m2, m3,
+       headers = c("Baseline", "Interaction", "Controls"),
+       vcov = "cluster",
+       se.below = TRUE)
+```
+
+```{r interpretation}
+# ---- 5. Interpretation ----
+cat("\n=== KEY COEFFICIENTS (Model 2) ===\n")
+coefs <- coef(m2)
+cat("moved:               ",
+    round(coefs["moved"], 4),
+    " -- effect of moving (pre-move non-religious)\n")
+cat("religious_lag:        ",
+    round(coefs["religious_lag"], 4),
+    " -- within-family effect of being religious\n")
+cat("moved:religious_lag:  ",
+    round(coefs["moved:religious_lag"], 4),
+    " -- DIFFERENTIAL effect for pre-move religious\n")
+cat("\nPositive interaction = religious people's",
+    "giving decreases LESS after moving.\n")
+cat("Negative interaction = religious people's",
+    "giving decreases MORE after moving.\n")
+```
+
+```{r plot_setup}
+PLOT_DIR <- here("plots")
+if (!dir.exists(PLOT_DIR)) dir.create(PLOT_DIR, recursive = TRUE)
+```
+
+```{r plot_descriptive, fig.width=7, fig.height=5}
+# ---- 6. Descriptive bar chart: mean giving by moved x religiosity ----
+desc_plot <- analysis |>
+  filter(!is.na(religious_lag), !is.na(moved)) |>
+  mutate(
+    Moved     = factor(moved, levels = c(0, 1),
+                       labels = c("Did not move", "Moved")),
+    Religious = factor(religious_lag, levels = c(0, 1),
+                       labels = c("Not religious (prior wave)",
+                                  "Religious (prior wave)"))
+  ) |>
+  group_by(Moved, Religious) |>
+  summarise(
+    mean_giving   = mean(total_giving, na.rm = TRUE),
+    se            = sd(total_giving, na.rm = TRUE) / sqrt(n()),
+    median_giving = median(total_giving, na.rm = TRUE),
+    n             = n(),
+    .groups = "drop"
+  )
+
+ggplot(desc_plot, aes(x = Moved, y = mean_giving, fill = Religious)) +
+  geom_col(position = position_dodge(width = 0.7), width = 0.6) +
+  geom_errorbar(
+    aes(ymin = mean_giving - 1.96 * se,
+        ymax = mean_giving + 1.96 * se),
+    position = position_dodge(width = 0.7), width = 0.2
+  ) +
+  geom_text(
+    aes(label = paste0("n=", scales::comma(n))),
+    position = position_dodge(width = 0.7),
+    vjust = -0.5, size = 3
+  ) +
+  scale_fill_manual(values = c("#7f8c8d", "#2980b9")) +
+  scale_y_continuous(labels = scales::dollar_format()) +
+  labs(
+    title    = "Mean Charitable Giving by Move Status and Pre-Move Religiosity",
+    subtitle = "PSID 2003-2021 (lagged religiosity sample)",
+    x = NULL, y = "Mean total giving ($)",
+    fill = NULL
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(legend.position = "top")
+
+ggsave(file.path(PLOT_DIR, "descriptive_giving_by_group.png"),
+       width = 7, height = 5, dpi = 300)
+```
+
+```{r plot_descriptive_by_year, fig.width=14, fig.height=10}
+# ---- 6b. Descriptive bar chart by year ----
+desc_by_year <- analysis |>
+  filter(!is.na(religious_lag), !is.na(moved), wave >= 2003) |>
+  mutate(
+    Moved     = factor(moved, levels = c(0, 1),
+                       labels = c("Did not move", "Moved")),
+    Religious = factor(religious_lag, levels = c(0, 1),
+                       labels = c("Not religious", "Religious"))
+  ) |>
+  group_by(wave, Moved, Religious) |>
+  summarise(
+    mean_giving = mean(total_giving, na.rm = TRUE),
+    se          = sd(total_giving, na.rm = TRUE) / sqrt(n()),
+    n           = n(),
+    .groups     = "drop"
+  )
+
+ggplot(desc_by_year,
+       aes(x = Moved, y = mean_giving, fill = Religious)) +
+  geom_col(position = position_dodge(width = 0.7), width = 0.6) +
+  geom_errorbar(
+    aes(ymin = mean_giving - 1.96 * se,
+        ymax = mean_giving + 1.96 * se),
+    position = position_dodge(width = 0.7), width = 0.2
+  ) +
+  geom_text(
+    aes(label = paste0("n=", scales::comma(n))),
+    position = position_dodge(width = 0.7),
+    vjust = -0.5, size = 2.5
+  ) +
+  facet_wrap(~ wave) +
+  scale_fill_manual(values = c("#7f8c8d", "#2980b9")) +
+  scale_y_continuous(labels = scales::dollar_format()) +
+  labs(
+    title    = "Mean Giving by Move Status & Pre-Move Religiosity",
+    subtitle = "PSID, by wave (lagged religiosity sample)",
+    x = NULL, y = "Mean total giving ($)",
+    fill = NULL
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(legend.position = "top")
+
+ggsave(file.path(PLOT_DIR, "descriptive_giving_by_group_year.png"),
+       width = 14, height = 10, dpi = 300)
+```
+
+```{r plot_coefplot, fig.width=7, fig.height=4}
+# ---- 7. Coefficient plot from the three models ----
+coefplot(list("Baseline" = m1,
+              "Interaction" = m2,
+              "Controls" = m3),
+         vcov = "cluster",
+         keep = c("moved", "religious_lag",
+                   "moved:religious_lag"),
+         main = "Effect of Moving on log(Giving + 1)",
+         sub  = "Family & wave FE, clustered SEs",
+         ref.line = 0)
+
+png(file.path(PLOT_DIR, "coefficient_plot.png"),
+    width = 7, height = 4, units = "in", res = 300)
+coefplot(list("Baseline" = m1,
+              "Interaction" = m2,
+              "Controls" = m3),
+         vcov = "cluster",
+         keep = c("moved", "religious_lag",
+                  "moved:religious_lag"),
+         main = "Effect of Moving on log(Giving + 1)",
+         sub  = "Family & wave FE, clustered SEs",
+         ref.line = 0)
+dev.off()
+```
+
+```{r plot_trends, fig.width=9, fig.height=5}
+# ---- 8. Giving trends over time by mover status x religiosity ----
+trends <- analysis |>
+  filter(!is.na(religious_lag), !is.na(moved)) |>
+  mutate(
+    group = case_when(
+      moved == 0 & religious_lag == 1 ~ "Stayer, Religious",
+      moved == 0 & religious_lag == 0 ~ "Stayer, Not religious",
+      moved == 1 & religious_lag == 1 ~ "Mover, Religious",
+      moved == 1 & religious_lag == 0 ~ "Mover, Not religious"
+    )
+  ) |>
+  group_by(wave, group) |>
+  summarise(
+    mean_log_giving = mean(log_giving, na.rm = TRUE),
+    se = sd(log_giving, na.rm = TRUE) / sqrt(n()),
+    n = n(),
+    .groups = "drop"
+  )
+
+ggplot(trends, aes(x = wave, y = mean_log_giving,
+                   colour = group, linetype = group)) +
+  geom_line(linewidth = 0.9) +
+  geom_point(size = 2) +
+  geom_ribbon(
+    aes(ymin = mean_log_giving - 1.96 * se,
+        ymax = mean_log_giving + 1.96 * se,
+        fill = group),
+    alpha = 0.1, colour = NA
+  ) +
+  scale_colour_manual(values = c(
+    "Stayer, Religious"     = "#2980b9",
+    "Stayer, Not religious" = "#7f8c8d",
+    "Mover, Religious"      = "#e74c3c",
+    "Mover, Not religious"  = "#e67e22"
+  )) +
+  scale_fill_manual(values = c(
+    "Stayer, Religious"     = "#2980b9",
+    "Stayer, Not religious" = "#7f8c8d",
+    "Mover, Religious"      = "#e74c3c",
+    "Mover, Not religious"  = "#e67e22"
+  )) +
+  scale_x_continuous(breaks = seq(2001, 2021, 2)) +
+  labs(
+    title    = "Mean log(Giving + 1) Over Time by Group",
+    subtitle = "PSID 2003-2021 (lagged religiosity sample)",
+    x = "Wave", y = "Mean log(giving + 1)",
+    colour = NULL, fill = NULL, linetype = NULL
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(legend.position = "top")
+
+ggsave(file.path(PLOT_DIR, "giving_trends_by_group.png"),
+       width = 9, height = 5, dpi = 300)
+```
+
+```{r plot_move_rate, fig.width=7, fig.height=4}
+# ---- 9. Moving rate over time by religiosity ----
+move_rate <- analysis |>
+  filter(!is.na(religious_lag), !is.na(moved)) |>
+  mutate(Religious = factor(religious_lag, levels = c(0, 1),
+                            labels = c("Not religious", "Religious"))) |>
+  group_by(wave, Religious) |>
+  summarise(pct_moved = 100 * mean(moved), .groups = "drop")
+
+ggplot(move_rate, aes(x = wave, y = pct_moved,
+                      colour = Religious)) +
+  geom_line(linewidth = 0.9) +
+  geom_point(size = 2) +
+  scale_colour_manual(values = c("#7f8c8d", "#2980b9")) +
+  scale_x_continuous(breaks = seq(2001, 2021, 2)) +
+  scale_y_continuous(labels = function(x) paste0(x, "%")) +
+  labs(
+    title    = "Moving Rate Over Time by Pre-Move Religiosity",
+    subtitle = "PSID 2003-2021",
+    x = "Wave", y = "% who moved",
+    colour = NULL
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(legend.position = "top")
+
+ggsave(file.path(PLOT_DIR, "move_rate_by_religiosity.png"),
+       width = 7, height = 4, dpi = 300)
+```
+

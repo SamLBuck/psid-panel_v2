@@ -1,0 +1,460 @@
+---
+title: "PSID Panel Validation Checks"
+output: html_document
+---
+
+```{r setup, message=FALSE}
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(arrow)
+  library(here)
+  library(glue)
+})
+
+panel <- read_parquet(here("output", "psid_family_year_2001_latest.parquet"))
+PLOT_DIR <- here("plots")
+if (!dir.exists(PLOT_DIR)) dir.create(PLOT_DIR, recursive = TRUE)
+
+# --- Patch: add id_1968 if missing from the parquet ---
+# This avoids a full 20-min rebuild of build_panel.Rmd.
+# Reads ONLY the family_id + id_1968 columns from each wave's raw file.
+if (!"id_1968" %in% names(panel)) {
+  cat("id_1968 not in parquet — patching from raw files...\n")
+
+  DATA_DIR <- here("data_raw")
+
+  # Reuse the .sps parser from build_panel
+  parse_sps_positions <- function(dict_path) {
+    lines <- read_lines(dict_path)
+    dl <- which(str_detect(lines, regex("^\\s*DATA\\s+LIST",
+                                        ignore_case = TRUE)))
+    if (!length(dl)) return(tibble(var = character(),
+                                   start = integer(),
+                                   end = integer()))
+    after <- lines[seq(dl[1], length(lines))]
+    stop_idx <- which(str_detect(
+      after, regex("^\\s*VARIABLE\\s+LABELS", ignore_case = TRUE)))
+    if (length(stop_idx)) after <- after[seq(1, stop_idx[1] - 1)]
+    after <- gsub("\\t", " ", after)
+    after <- gsub("\\*.*$", "", after)
+    after <- str_squish(after)
+    after <- after[after != ""]
+    sl <- which(str_detect(after, "^/"))
+    if (length(sl)) after <- after[seq(sl[1], length(after))]
+    blob <- paste(after, collapse = " ")
+    m <- str_match_all(
+      blob,
+      "(?i)\\b([A-Za-z0-9_]+)\\s+(\\d+)\\s*-\\s*(\\d+)\\s*(\\([aA]\\))?"
+    )[[1]]
+    if (!nrow(m)) return(tibble(var = character(),
+                                start = integer(),
+                                end = integer()))
+    tibble(var   = m[, 2],
+           start = as.integer(m[, 3]),
+           end   = as.integer(m[, 4])) |>
+      distinct(var, .keep_all = TRUE) |>
+      arrange(start)
+  }
+
+  # ER codes: family_id and id_1968 per wave
+  id_map <- tribble(
+    ~wave, ~fid_er,    ~id68_er,
+    2001,  "ER17002",  "ER17022",
+    2003,  "ER21002",  "ER21009",
+    2005,  "ER25002",  "ER25009",
+    2007,  "ER36002",  "ER36009",
+    2009,  "ER42002",  "ER42009",
+    2011,  "ER47302",  "ER47309",
+    2013,  "ER53002",  "ER53009",
+    2015,  "ER60002",  "ER60009",
+    2017,  "ER66002",  "ER66009",
+    2019,  "ER72002",  "ER72009",
+    2021,  "ER78002",  "ER78009"
+  )
+
+  patch_rows <- map_dfr(seq_len(nrow(id_map)), function(i) {
+    yr      <- id_map$wave[i]
+    fid_er  <- id_map$fid_er[i]
+    id68_er <- id_map$id68_er[i]
+    stem    <- glue("FAM{yr}ER")
+    txt     <- file.path(DATA_DIR, paste0(stem, ".txt"))
+    sps     <- file.path(DATA_DIR, paste0(stem, ".sps"))
+    dict    <- parse_sps_positions(sps)
+    # Read only the two columns we need
+    keep    <- dict |> filter(var %in% c(fid_er, id68_er))
+    df      <- readr::read_fwf(
+      txt,
+      col_positions = readr::fwf_positions(keep$start, keep$end, keep$var),
+      col_types     = cols(.default = col_double()),
+      progress      = FALSE
+    )
+    tibble(
+      family_id = as.integer(df[[fid_er]]),
+      id_1968   = as.integer(df[[id68_er]]),
+      wave      = as.integer(yr)
+    )
+  })
+
+  panel <- panel |>
+    left_join(patch_rows, by = c("family_id", "wave"))
+
+  cat("Patched! id_1968 now has",
+      sum(!is.na(panel$id_1968)), "non-NA values\n")
+}
+
+# --- Splitoff deduplication ---
+# Within each (id_1968, wave), multiple families can exist (splitoffs).
+# Keep the family with the oldest head (the original household).
+n_before <- nrow(panel)
+panel <- panel |>
+  group_by(id_1968, wave) |>
+  slice_max(head_age, n = 1, with_ties = FALSE) |>
+  ungroup()
+
+cat("Splitoff dedup: removed",
+    n_before - nrow(panel), "rows\n")
+
+cat("Panel:", nrow(panel), "rows,", ncol(panel), "columns\n")
+cat("Unique id_1968 (lineages):", n_distinct(panel$id_1968), "\n")
+cat("Unique family_id:", n_distinct(panel$family_id), "\n")
+cat("Waves:", paste(sort(unique(panel$wave)), collapse = ", "), "\n")
+```
+
+```{r check_state_stability, fig.width=9, fig.height=6}
+# ---- 1. State stability: does a family stay in the same state? ----
+# Using id_1968 (1968 Family Identifier) as the longitudinal key.
+# Most non-movers should have the same state across waves.
+
+state_changes <- panel |>
+  filter(!is.na(`Current State`)) |>
+  arrange(id_1968, wave) |>
+  group_by(id_1968) |>
+  mutate(
+    prev_state = lag(`Current State`, order_by = wave),
+    state_changed = !is.na(prev_state) & `Current State` != prev_state,
+    moved = case_when(
+      is.na(`WHY MOVED 1ST`) ~ 0L,
+      `WHY MOVED 1ST` >= 97 ~ NA_integer_,
+      `WHY MOVED 1ST` > 0 ~ 1L,
+      TRUE ~ 0L
+    )
+  ) |>
+  ungroup()
+
+# Cross-tab: state changed vs. reported move
+state_move_xtab <- state_changes |>
+  filter(!is.na(prev_state), !is.na(moved)) |>
+  count(state_changed, moved) |>
+  mutate(label = case_when(
+    !state_changed & moved == 0 ~ "Same state, no move",
+    !state_changed & moved == 1 ~ "Same state, reported move",
+    state_changed & moved == 0  ~ "STATE CHANGED, no move (!)",
+    state_changed & moved == 1  ~ "State changed, moved"
+  ))
+
+cat("=== State change vs. reported move ===\n")
+print(state_move_xtab)
+
+cat("\n--- Interpretation ---\n")
+cat("'STATE CHANGED, no move' = possible splitoff or coding issue,\n")
+cat("  OR within-state moves that cross FIPS boundaries.\n")
+cat("'Same state, reported move' = moved within same state (expected).\n")
+
+# How many families have the SAME state in every wave?
+n_waves_per_fam <- panel |>
+  filter(!is.na(`Current State`)) |>
+  group_by(id_1968) |>
+  summarise(
+    n_waves = n(),
+    n_states = n_distinct(`Current State`),
+    .groups = "drop"
+  )
+
+cat("\n=== State consistency across waves ===\n")
+cat("Families in 5+ waves:\n")
+multi <- n_waves_per_fam |> filter(n_waves >= 5)
+cat("  Same state in all waves:",
+    sum(multi$n_states == 1), "/", nrow(multi),
+    "(", round(100 * mean(multi$n_states == 1), 1), "%)\n")
+cat("  2 states:",
+    sum(multi$n_states == 2), "(", round(100 * mean(multi$n_states == 2), 1), "%)\n")
+cat("  3+ states:",
+    sum(multi$n_states >= 3), "(", round(100 * mean(multi$n_states >= 3), 1), "%)\n")
+```
+
+```{r check_age_progression, fig.width=8, fig.height=5}
+# ---- 2. Head age progression: does age increase by ~2 each wave? ----
+age_check <- panel |>
+  filter(!is.na(head_age), head_age > 0, head_age < 120) |>
+  arrange(id_1968, wave) |>
+  group_by(id_1968) |>
+  mutate(
+    prev_age  = lag(head_age, order_by = wave),
+    prev_wave = lag(wave, order_by = wave),
+    age_delta = head_age - prev_age,
+    wave_gap  = wave - prev_wave
+  ) |>
+  filter(!is.na(prev_age)) |>
+  ungroup()
+
+cat("=== Age progression between consecutive waves ===\n")
+cat("Expected: +2 for biennial waves (same head)\n")
+cat("  Mean age delta:", round(mean(age_check$age_delta), 2), "\n")
+cat("  Median age delta:", median(age_check$age_delta), "\n\n")
+
+age_dist <- age_check |>
+  filter(wave_gap == 2) |>
+  count(age_delta) |>
+  mutate(pct = round(100 * n / sum(n), 1))
+
+cat("Age delta distribution (2-year gaps only):\n")
+print(age_dist |> filter(n >= 50), n = 20)
+
+# Flag suspicious: age jumped by >5 or went backwards
+suspicious_age <- age_check |>
+  filter(wave_gap == 2, (age_delta > 5 | age_delta < 0))
+
+cat("\nSuspicious age jumps (delta > 5 or < 0, 2-year gap):",
+    nrow(suspicious_age), "of", nrow(filter(age_check, wave_gap == 2)),
+    "(", round(100 * nrow(suspicious_age) /
+                 nrow(filter(age_check, wave_gap == 2)), 2), "%)\n")
+cat("These likely indicate a change in household head.\n")
+
+p_age <- ggplot(age_check |> filter(wave_gap == 2),
+                aes(x = age_delta)) +
+  geom_histogram(binwidth = 1, fill = "#2980b9", colour = "white") +
+  geom_vline(xintercept = 2, colour = "red", linetype = "dashed") +
+  scale_x_continuous(breaks = seq(-20, 30, 2)) +
+  coord_cartesian(xlim = c(-10, 15)) +
+  labs(title = "Head Age Change Between Consecutive Waves",
+       subtitle = "Red line = expected +2 years",
+       x = "Age delta", y = "Count") +
+  theme_minimal(base_size = 13)
+
+print(p_age)
+ggsave(file.path(PLOT_DIR, "validation_age_delta.png"),
+       p_age, width = 8, height = 5, dpi = 300)
+```
+
+```{r check_wave_gaps}
+# ---- 3. Wave gaps: do families skip waves? ----
+# If a family skips a wave, lag() in the analysis grabs the wrong wave's
+# religiosity (e.g., 4-year lag instead of 2-year).
+
+wave_gaps <- panel |>
+  arrange(id_1968, wave) |>
+  group_by(id_1968) |>
+  mutate(
+    prev_wave = lag(wave, order_by = wave),
+    gap = wave - prev_wave
+  ) |>
+  filter(!is.na(prev_wave)) |>
+  ungroup()
+
+gap_dist <- wave_gaps |> count(gap) |> mutate(pct = round(100 * n / sum(n), 1))
+cat("=== Wave gap distribution ===\n")
+print(gap_dist)
+
+n_bad_gaps <- sum(wave_gaps$gap != 2)
+cat("\nNon-consecutive transitions (gap != 2):", n_bad_gaps,
+    "of", nrow(wave_gaps),
+    "(", round(100 * n_bad_gaps / nrow(wave_gaps), 2), "%)\n")
+cat("These make lag() grab a value from >1 wave ago.\n")
+```
+
+```{r check_mover_rate, fig.width=8, fig.height=5}
+# ---- 4. Mover rate sanity check ----
+# US moving rate is ~10-15%/year, so ~20-25% per 2-year window.
+# 35% seems high — check the distribution of WHY MOVED 1ST codes.
+
+cat("=== WHY MOVED 1ST value distribution ===\n")
+why_moved_dist <- panel |>
+  count(`WHY MOVED 1ST`) |>
+  mutate(pct = round(100 * n / sum(n), 1))
+print(why_moved_dist)
+
+move_by_wave <- panel |>
+  mutate(moved = case_when(
+    is.na(`WHY MOVED 1ST`) ~ 0L,
+    `WHY MOVED 1ST` >= 97 ~ NA_integer_,
+    `WHY MOVED 1ST` > 0 ~ 1L,
+    TRUE ~ 0L
+  )) |>
+  filter(!is.na(moved)) |>
+  group_by(wave) |>
+  summarise(
+    n = n(),
+    n_moved = sum(moved),
+    pct_moved = round(100 * mean(moved), 1),
+    .groups = "drop"
+  )
+
+cat("\n=== Moving rate by wave ===\n")
+print(move_by_wave)
+
+p_move <- ggplot(move_by_wave, aes(x = wave, y = pct_moved)) +
+  geom_col(fill = "#e74c3c", width = 1.5) +
+  geom_hline(yintercept = 25, linetype = "dashed", colour = "grey40") +
+  annotate("text", x = 2003, y = 26.5, label = "~25% expected",
+           colour = "grey40", size = 3.5) +
+  scale_x_continuous(breaks = seq(2001, 2021, 2)) +
+  scale_y_continuous(labels = function(x) paste0(x, "%")) +
+  labs(title = "Mover Rate by Wave",
+       subtitle = "Based on WHY MOVED 1ST > 0",
+       x = "Wave", y = "% who moved") +
+  theme_minimal(base_size = 13)
+
+print(p_move)
+ggsave(file.path(PLOT_DIR, "validation_mover_rate.png"),
+       p_move, width = 8, height = 5, dpi = 300)
+```
+
+```{r check_state_vs_move, fig.width=8, fig.height=5}
+# ---- 5. Cross-validate movers against state changes ----
+# Movers who change state = confirmed interstate move
+# Movers who stay in same state = within-state move (plausible)
+# Non-movers who change state = RED FLAG (family_id may be wrong)
+
+cross_val <- state_changes |>
+  filter(!is.na(prev_state), !is.na(moved)) |>
+  mutate(
+    category = case_when(
+      moved == 1 & state_changed  ~ "Mover, changed state",
+      moved == 1 & !state_changed ~ "Mover, same state",
+      moved == 0 & state_changed  ~ "Non-mover, changed state (!)",
+      moved == 0 & !state_changed ~ "Non-mover, same state"
+    )
+  ) |>
+  count(category) |>
+  mutate(pct = round(100 * n / sum(n), 1))
+
+cat("=== Move status vs. state change cross-validation ===\n")
+print(cross_val)
+
+# Show the non-mover state changers by wave
+if (any(state_changes$state_changed & state_changes$moved == 0,
+        na.rm = TRUE)) {
+  flag_by_wave <- state_changes |>
+    filter(!is.na(prev_state), moved == 0, state_changed) |>
+    count(wave) |>
+    mutate(pct_of_wave = NA_real_)
+
+  # Add context: what % of non-movers changed state
+  for (i in seq_len(nrow(flag_by_wave))) {
+    w <- flag_by_wave$wave[i]
+    total_nonmover <- sum(
+      state_changes$wave == w &
+      state_changes$moved == 0 &
+      !is.na(state_changes$prev_state),
+      na.rm = TRUE
+    )
+    flag_by_wave$pct_of_wave[i] <- round(
+      100 * flag_by_wave$n[i] / total_nonmover, 2
+    )
+  }
+  cat("\nNon-movers who changed state, by wave:\n")
+  print(flag_by_wave)
+}
+```
+
+```{r check_religiosity_stability, fig.width=8, fig.height=5}
+# ---- 6. Religious preference stability ----
+# Religious preference should be fairly stable within a family.
+# Frequent flipping suggests head changes or coding issues.
+
+relig_check <- panel |>
+  filter(!is.na(Religious_Preference)) |>
+  arrange(id_1968, wave) |>
+  group_by(id_1968) |>
+  mutate(
+    religious = case_when(
+      Religious_Preference %in% c(0, 97, 98, 99) ~ 0L,
+      TRUE ~ 1L
+    ),
+    prev_religious = lag(religious, order_by = wave),
+    switched = !is.na(prev_religious) & religious != prev_religious
+  ) |>
+  ungroup()
+
+n_switches <- sum(relig_check$switched, na.rm = TRUE)
+n_transitions <- sum(!is.na(relig_check$prev_religious))
+
+cat("=== Religiosity stability ===\n")
+cat("Transitions with a switch:", n_switches, "/", n_transitions,
+    "(", round(100 * n_switches / n_transitions, 2), "%)\n")
+
+# How many families ever switch?
+fam_switches <- relig_check |>
+  group_by(id_1968) |>
+  summarise(n_switches = sum(switched, na.rm = TRUE),
+            n_waves = n(), .groups = "drop")
+
+cat("Families that never switch:", sum(fam_switches$n_switches == 0),
+    "/", nrow(fam_switches),
+    "(", round(100 * mean(fam_switches$n_switches == 0), 1), "%)\n")
+cat("Families switching 1 time:", sum(fam_switches$n_switches == 1), "\n")
+cat("Families switching 2+ times:", sum(fam_switches$n_switches >= 2), "\n")
+```
+
+```{r check_giving_2021, fig.width=8, fig.height=5}
+# ---- 7. 2021 giving gap check ----
+# 2021 dropped the "WTR DONATION>25" gatekeeper. Are non-donors coded
+# as 0 or NA in the dollar columns?
+
+dollar_cols <- names(panel)[str_detect(names(panel), "DOLLAR AMT")]
+
+giving_by_wave <- panel |>
+  pivot_longer(all_of(dollar_cols), names_to = "category",
+               values_to = "amount") |>
+  mutate(amount = if_else(amount >= 999997, NA_real_, amount)) |>
+  group_by(wave, category) |>
+  summarise(
+    n = n(),
+    n_na = sum(is.na(amount)),
+    n_zero = sum(amount == 0, na.rm = TRUE),
+    pct_na = round(100 * n_na / n, 1),
+    pct_zero = round(100 * n_zero / n, 1),
+    mean_amt = round(mean(amount, na.rm = TRUE), 1),
+    .groups = "drop"
+  )
+
+cat("=== NA and zero rates in dollar columns by wave ===\n")
+cat("(Look for 2021 having more NAs or fewer zeros than other years)\n\n")
+print(giving_by_wave |> filter(category == "DOLLAR AMT OF RELIGIOUS DONATIONS"),
+      n = 11)
+cat("\n")
+print(giving_by_wave |> filter(category == "DOLLAR AMT OF NEEDY DONATIONS"),
+      n = 11)
+
+# Plot NA rate across waves
+p_na <- giving_by_wave |>
+  ggplot(aes(x = wave, y = pct_na, colour = category)) +
+  geom_line(linewidth = 0.8) +
+  geom_point(size = 2) +
+  scale_x_continuous(breaks = seq(2001, 2021, 2)) +
+  labs(title = "% NA in Dollar Amount Columns by Wave",
+       subtitle = "Spike in 2021 = gatekeeper question removed?",
+       x = "Wave", y = "% NA", colour = NULL) +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "bottom",
+        legend.text = element_text(size = 8))
+
+print(p_na)
+ggsave(file.path(PLOT_DIR, "validation_giving_na_by_wave.png"),
+       p_na, width = 8, height = 5, dpi = 300)
+```
+
+```{r summary}
+cat("\n", strrep("=", 60), "\n")
+cat("VALIDATION SUMMARY\n")
+cat(strrep("=", 60), "\n\n")
+cat("Run through each check above and look for:\n")
+cat("  1. State stability - most non-movers should stay in same state\n")
+cat("  2. Age delta - should peak at +2; big jumps = head changed\n")
+cat("  3. Wave gaps - non-consecutive waves break lag()\n")
+cat("  4. Mover rate - should be ~20-25% per wave, not 35%\n")
+cat("  5. State vs. move cross-check - non-movers changing state = red flag\n")
+cat("  6. Religiosity flipping - should be rare within family\n")
+cat("  7. 2021 giving NAs - check if gatekeeper removal biases data\n")
+```
+

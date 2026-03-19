@@ -1,0 +1,17 @@
+# Raw PSID data (large, not redistributable)
+data_raw/*.txt
+
+# Build outputs
+output/*.parquet
+
+# Temp scripts
+check_analysis.R
+check_waves.R
+
+# R / RStudio
+.Rproj.user
+.Rhistory
+.RData
+.Ruserdata
+*.Rproj
+

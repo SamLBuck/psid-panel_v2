@@ -1,0 +1,573 @@
+---
+title: "Git_Setup"
+output: html_document
+date: "2025-10-20"
+---
+
+
+```{r 3_without_psidR}
+
+library(tidyverse)
+library(readr)
+install.packages('arrow')
+library(arrow)
+install.packages('glue')
+library(glue)
+install.packages('stringr')
+library(stringr)
+install.packages('fs')
+library(fs)
+install.packages('here')
+library(here)
+```
+
+```{r skeleton2}
+
+suppressPackageStartupMessages({
+  library(readr); library(dplyr); library(stringr); library(tibble)
+  library(purrr); library(fs);    library(glue);    library(here)
+  library(arrow)
+})
+
+DATA_DIR  <- here("data_raw")
+XWALK_DIR <- here("xwalk")
+OUT_PATH  <- here("output", "psid_family_year_2001_latest.parquet")
+
+dir_create(DATA_DIR); dir_create(XWALK_DIR); dir_create(path_dir(OUT_PATH))
+
+# If you only want specific waves, set here; otherwise we’ll auto-detect all available
+waves <- c(2001, 2003, 2005, 2007, 2009, 2011, 2013, 2015, 2017, 2019, 2021)
+
+`%OR%` <- function(x, y) if (is.null(x) || length(x) == 0 || all(is.na(x))) y else x
+
+# -----------------------------
+# Dictionary parsing (SPSS/Stata)
+# -----------------------------
+parse_sps_positions <- function(dict_path) {
+  lines <- read_lines(dict_path)
+  dl_start <- which(str_detect(lines, regex("^\\s*DATA\\s+LIST", ignore_case = TRUE)))
+  if (!length(dl_start)) return(tibble(var=character(), start=integer(), end=integer(), width=integer(), type=character()))
+
+  after <- lines[seq(dl_start[1], length(lines))]
+  stop_idx <- which(str_detect(after, regex("^\\s*VARIABLE\\s+LABELS", ignore_case = TRUE)))
+  if (length(stop_idx)) after <- after[seq(1, stop_idx[1] - 1)]
+
+  after <- gsub("\\t", " ", after)
+  after <- gsub("\\*.*$", "", after)
+  after <- str_squish(after)
+  after <- after[after != ""]
+  sl <- which(str_detect(after, "^/"))
+  if (length(sl)) after <- after[seq(sl[1], length(after))]
+
+  blob <- paste(after, collapse = " ")
+  m <- str_match_all(blob, "(?i)\\b([A-Za-z0-9_]+)\\s+(\\d+)\\s*-\\s*(\\d+)\\s*(\\([aA]\\))?")[[1]]
+  if (!nrow(m)) return(tibble(var=character(), start=integer(), end=integer(), width=integer(), type=character()))
+
+  tibble(
+    var   = m[,2],
+    start = as.integer(m[,3]),
+    end   = as.integer(m[,4]),
+    type  = ifelse(!is.na(m[,5]) & m[,5] != "", "character", "numeric")
+  ) |>
+    mutate(width = end - start + 1L) |>
+    distinct(var, .keep_all = TRUE) |>
+    arrange(start)
+}
+
+parse_do_positions <- function(dict_path) {
+  lines <- read_lines(dict_path) |> str_squish()
+  pat <- "(str\\d+|byte|int|long|double)?\\s*([A-Za-z0-9_]+)\\s+(\\d+)\\s*-\\s*(\\d+)"
+  toks <- str_extract_all(lines, pat) |> unlist()
+  if (!length(toks)) return(tibble(var=character(), start=integer(), end=integer(), width=integer(), type=character()))
+
+  mats <- str_match_all(toks, pat)
+  map_dfr(mats, ~tibble(
+    type_token = .x[,2],
+    var        = .x[,3],
+    start      = as.integer(.x[,4]),
+    end        = as.integer(.x[,5])
+  )) |>
+    mutate(width = end - start + 1L,
+           type  = ifelse(!is.na(type_token) & str_detect(type_token, "^str\\d+$"), "character", "numeric")) |>
+    select(var, start, end, width, type) |>
+    distinct(var, .keep_all = TRUE) |>
+    arrange(start)
+}
+
+get_dict_positions <- function(stem) {
+  sps <- path(DATA_DIR, paste0(stem, ".sps"))
+  dof <- path(DATA_DIR, paste0(stem, ".do"))
+  if (file_exists(sps)) return(parse_sps_positions(sps))
+  if (file_exists(dof)) return(parse_do_positions(dof))
+  warning(glue("No .sps or .do dictionary found for {stem}"))
+  tibble(var=character(), start=integer(), end=integer(), width=integer(), type=character())
+}
+
+# -----------------------------
+# Fixed-width reader
+# -----------------------------
+read_fixed_width <- function(stem) {
+  txt <- path(DATA_DIR, paste0(stem, ".txt"))
+  if (!file_exists(txt)) {
+    warning(glue("Missing {path_file(txt)}"))
+    return(tibble())
+  }
+
+  dict <- get_dict_positions(stem)
+  if (!nrow(dict)) {
+    warning(glue("No positions parsed from dictionary for {stem}"))
+    return(tibble())
+  }
+
+  fwf <- readr::fwf_positions(dict$start, dict$end, dict$var)
+  col_types <- paste(ifelse(dict$type == "character", "c", "d"), collapse = "")
+
+  df <- readr::read_fwf(
+    file = txt,
+    col_positions = fwf,
+    col_types = col_types,
+    na = c("", " ", ".", "NA")
+  )
+
+  char_cols <- names(df)[map_lgl(df, is.character)]
+  df |> mutate(across(all_of(char_cols), ~na_if(str_trim(.x), "")))
+}
+
+# -----------------------------
+# Crosswalk loader
+# -----------------------------
+safe_read_xwalk <- function(fname) {
+  p <- path(XWALK_DIR, fname)
+  if (!file_exists(p)) return(tibble(wave=integer(), varname=character(), source=character()))
+  out <- tryCatch(
+    readr::read_csv(p, show_col_types = FALSE),
+    error = function(e) tibble(wave=integer(), varname=character(), source=character())
+  )
+  names(out) <- tolower(trimws(names(out)))
+  needed <- c("wave","varname","source")
+  if (!all(needed %in% names(out))) return(tibble(wave=integer(), varname=character(), source=character()))
+  mutate(out, wave = as.integer(wave))
+}
+
+family_xw <- safe_read_xwalk("family_vars_crosswalk.csv")
+hs_xw     <- safe_read_xwalk("head_spouse_crosswalk.csv")
+indocc_xw <- safe_read_xwalk("industry_occupation_xwalk.csv")
+phil_xw   <- safe_read_xwalk("philanthropy_crosswalk.csv")
+mob_xw    <- safe_read_xwalk("mobility_crosswalk.csv")
+state_xw  <- safe_read_xwalk("state_crosswalk.csv")
+relig_xw  <- safe_read_xwalk("religiosity_crosswalk.csv")
+roster_xw <- safe_read_xwalk("roster_crosswalk.csv")
+
+# Select + rename variables for a wave using crosswalk
+apply_xwalk <- function(df, xw, yr) {
+  if (!nrow(df) || !nrow(xw)) return(tibble())
+  xwy <- xw |> filter(wave == yr)
+  if (!nrow(xwy)) return(tibble())
+
+  keep <- intersect(xwy$source, names(df))
+  if (!length(keep)) return(tibble())
+
+  out <- select(df, all_of(keep))
+  names(out) <- xwy |> filter(source %in% keep) |> arrange(match(source, keep)) |> pull(varname)
+  out
+}
+
+# Remove duplicate-named columns, keeping the first
+dedup_cols <- function(df) {
+  if (anyDuplicated(names(df))) df <- df[, !duplicated(names(df)), drop = FALSE]
+  df
+}
+
+# -----------------------------
+# Wave loaders
+# -----------------------------
+load_family_wave <- function(yr) read_fixed_width(glue("FAM{yr}ER")) |> mutate(wave = as.integer(yr))
+
+load_indiv_wave <- function(yr) {
+  stems <- c(glue("IND{yr}ER"), glue("PR{yr}ER"))
+  pick  <- stems[file_exists(path(DATA_DIR, paste0(stems, ".txt")))]
+  if (!length(pick)) return(NULL)
+  read_fixed_width(pick[[1]]) |> mutate(wave = as.integer(yr))
+}
+
+# -----------------------------
+# Key finders (crosswalk-only; no guessing)
+# -----------------------------
+find_family_id_col <- function(fam_df, yr) {
+  src <- family_xw |> filter(wave == yr, varname == "family_id") |> pull(source) |> first()
+  if (!is.na(src) && src %in% names(fam_df)) return(src)
+
+  stop("Missing/invalid mapping in family_vars_crosswalk.csv for wave ", yr)
+}
+
+find_interview_year <- function(fam_df, yr) {
+  src <- family_xw |> filter(wave == yr, varname == "interview_year") |> pull(source) |> first()
+  if (!is.na(src) && src %in% names(fam_df)) return(suppressWarnings(as.integer(fam_df[[src]])))
+
+  stop("Missing/invalid mapping for interview_year in family_vars_crosswalk.csv for wave ", yr)
+}
+
+# -----------------------------
+# Build a single wave
+# -----------------------------
+build_wave <- function(yr) {
+  fam <- load_family_wave(yr)
+  if (!nrow(fam)) return(tibble())
+  ind <- load_indiv_wave(yr)
+
+  # 1) Wave-unique family interview ID (ER*002)
+  fam_id_col <- find_family_id_col(fam, yr)
+
+  # 2) Optional 1968 family identifier (ER*022) – from crosswalk if you add it
+  fam_1968_col <- family_xw |>
+    filter(wave == yr, varname == "family_id_1968") |>
+    pull(source) |>
+    first()
+
+  keys <- tibble(
+    family_id      = fam[[fam_id_col]],
+    interview_year = find_interview_year(fam, yr),
+    wave           = as.integer(yr),
+    family_id_1968 = if (!is.na(fam_1968_col) && fam_1968_col %in% names(fam)) fam[[fam_1968_col]] else NA_real_
+  )
+
+  # prevent re-adding keys from the family crosswalk
+  fam_xw_no_keys <- family_xw |>
+    filter(!(varname %in% c("family_id","family_id_1968","interview_year","wave")))
+
+  add <- function(base, piece) if (!is.null(piece) && ncol(piece) > 0) bind_cols(base, piece) else base
+
+  out <- keys |>
+    add(apply_xwalk(fam, fam_xw_no_keys, yr)) |>
+    add(apply_xwalk(fam, hs_xw,     yr)) |>
+    add(apply_xwalk(fam, indocc_xw, yr)) |>
+    add(apply_xwalk(fam, phil_xw,   yr)) |>
+    add(apply_xwalk(fam, mob_xw,    yr)) |>
+    add(apply_xwalk(fam, state_xw,  yr)) |>
+    add(apply_xwalk(fam, relig_xw,  yr))
+
+  # Optional: children < 18 (only if roster_xw + IND/PR are available)
+  if (!is.null(ind) && nrow(roster_xw) && any(roster_xw$wave == yr)) {
+    rxy <- roster_xw |> filter(wave == yr)
+
+    age     <- rxy |> filter(varname=="age") |> pull(source) |> first()
+    in_fu   <- rxy |> filter(varname=="in_fu") |> pull(source) |> first()
+
+    # IMPORTANT: this should be the IND/PR file’s wave interview id field
+    ind_fid <- rxy |> filter(varname=="family_id") |> pull(source) |> first()
+
+    if (!any(is.na(c(age, in_fu, ind_fid))) && all(c(age, in_fu, ind_fid) %in% names(ind))) {
+      kids <- ind |>
+        transmute(
+          family_id = .data[[ind_fid]],
+          age       = suppressWarnings(as.numeric(.data[[age]])),
+          in_fu     = .data[[in_fu]]
+        ) |>
+        mutate(in_fu_ok = if (is.numeric(in_fu)) in_fu == 1 else in_fu %in% c("1","Y","YES")) |>
+        filter(in_fu_ok, !is.na(age), age < 18) |>
+        count(family_id, name = "n_children_u18")
+
+      out <- out |> left_join(kids, by = "family_id")
+    }
+  }
+
+  if (!"n_children_u18" %in% names(out)) out <- mutate(out, n_children_u18 = 0L)
+
+  out <- dedup_cols(out)
+
+  # Hard check: one row per family per wave (use wave interview id!)
+  dups <- out |> count(family_id, wave, name="n") |> filter(n > 1)
+  if (nrow(dups)) {
+    print(dups, n = 50)
+    stop("Wave ", yr, ": build_wave produced duplicate (family_id, wave) rows.")
+  }
+
+  out
+}
+
+# -----------------------------
+# Run all waves
+# -----------------------------
+fam_txts    <- dir_ls(DATA_DIR, regexp = "(?i)FAM\\d{4}ER\\.txt$")
+found_years <- str_extract(path_file(fam_txts), "\\d{4}") |> as.integer()
+use_years   <- (waves %OR% found_years) |> intersect(found_years) |> sort()
+if (!length(use_years)) stop("No FAM####ER.txt files found in ", DATA_DIR)
+
+panel <- map_dfr(use_years, build_wave)
+
+# Normalize/guarantee keys (family_id is the required wave-unique key)
+if (!"family_id" %in% names(panel)) stop("Build returned no family_id. Check crosswalk.")
+if (!"wave" %in% names(panel)) stop("Build returned no wave. Check build_wave().")
+if (!"interview_year" %in% names(panel)) stop("Build returned no interview_year. Check crosswalk.")
+
+panel <- panel |>
+  mutate(interview_year = coalesce(interview_year, wave)) |>
+    filter(!is.na(`Current State`)) |>
+  filter(!is.na(family_id), !is.na(wave), wave >= 2001) |>
+  arrange(family_id, wave) |>
+  relocate(family_id, interview_year, wave)
+
+# Final hard check across all waves (family_id + wave must be unique)
+dups_panel <- panel %>%
+  count(family_id, wave, name = "n") %>%
+  filter(n > 1)
+
+if (nrow(dups_panel)) {
+  print(dups_panel, n = 100)
+  stop("Panel has duplicate (family_id, wave) rows.")
+}
+
+write_parquet(panel, OUT_PATH)
+message(
+  "Wrote: ", OUT_PATH,
+  " | rows=", nrow(panel),
+  " | cols=", ncol(panel),
+  " | waves=", paste(sort(unique(panel$wave)), collapse = ", ")
+)
+
+```
+```{r load_fam}
+
+fam2001 <- load_family_wave(2001)
+fam2003 <- load_family_wave(2003)
+fam2005 <- load_family_wave(2005)
+fam2007 <- load_family_wave(2007)
+fam2009 <- load_family_wave(2009)
+fam2011 <- load_family_wave(2011)
+fam2013 <- load_family_wave(2013)
+fam2015 <- load_family_wave(2015)
+fam2017 <- load_family_wave(2017)
+fam2019 <- load_family_wave(2019)
+fam2021 <- load_family_wave(2021)
+
+
+```
+
+```{r smoke}
+build_wave <- function(yr, strict = TRUE) {
+  fam <- load_family_wave(yr)
+  if (!nrow(fam)) return(tibble())
+  ind <- load_indiv_wave(yr)
+
+  fam_id_col <- find_family_id_col(fam, yr)
+
+  keys <- tibble(
+    family_id_1968 = fam[[fam_id_col]],
+    interview_year = find_interview_year(fam, yr),
+    wave           = as.integer(yr)
+  )
+
+  fam_xw_no_keys <- family_xw |> filter(!(varname %in% c("family_id_1968","interview_year","wave")))
+
+  add <- function(base, piece) if (!is.null(piece) && ncol(piece) > 0) bind_cols(base, piece) else base
+
+  out <- keys |>
+    add(apply_xwalk(fam, fam_xw_no_keys, yr)) |>
+    add(apply_xwalk(fam, hs_xw,     yr)) |>
+    add(apply_xwalk(fam, indocc_xw, yr)) |>
+    add(apply_xwalk(fam, phil_xw,   yr)) |>
+    add(apply_xwalk(fam, mob_xw,    yr)) |>
+    add(apply_xwalk(fam, state_xw,  yr)) |>
+    add(apply_xwalk(fam, relig_xw,  yr))
+
+  if (!"n_children_u18" %in% names(out)) out <- mutate(out, n_children_u18 = 0L)
+
+  out <- dedup_cols(out)
+
+  dups <- out %>% count(family_id_1968, wave, name = "n") %>% filter(n > 1)
+  if (nrow(dups)) {
+    message("Wave ", yr, ": ", nrow(dups), " duplicated family_id_1968 values (showing top 20).")
+    print(dups |> arrange(desc(n)) |> head(20), n = 20)
+
+    if (strict) stop("Wave ", yr, ": build_wave produced duplicate (family_id_1968, wave) rows.")
+  }
+
+  out
+}
+tmp2001 <- build_wave(2001, strict = FALSE)
+tmp2001 %>%
+  count(family_id_1968, sort = TRUE) %>%
+  filter(n > 1) %>%
+  head(30)
+worst <- tmp2001 %>%
+  count(family_id_1968, sort = TRUE) %>%
+  slice(1) %>%
+  pull(family_id_1968)
+
+tmp2001 %>%
+  filter(family_id_1968 == worst) %>%
+  select(family_id_1968, interview_year, wave, everything()) %>%
+  head(50)
+
+cand <- names(fam2001)[stringr::str_detect(names(fam2001), "^ER\\d+$")]
+
+idish <- cand[stringr::str_detect(cand, "1700(2|9|11|22)$|1700\\d$")]
+idish
+
+fam2001 %>%
+  summarise(
+    n = n(),
+    n_unique_ER17002 = n_distinct(ER17002, na.rm = TRUE),
+    n_unique_ER17022 = n_distinct(ER17022, na.rm = TRUE),
+    n_dups_ER17002 = n() - n_distinct(ER17002, na.rm = TRUE),
+    n_dups_ER17022 = n() - n_distinct(ER17022, na.rm = TRUE)
+  )
+
+panel %>% count(wave)
+panel %>% summarise(
+  n = n(),
+  missing_family_id = sum(is.na(family_id)),
+  missing_interview_year = sum(is.na(interview_year))
+)
+
+
+# required columns present
+stopifnot(all(c("family_id","wave","interview_year") %in% names(panel)))
+
+# no missing keys
+panel %>% summarise(
+  n = n(),
+  miss_family_id = sum(is.na(family_id)),
+  miss_wave = sum(is.na(wave)),
+  miss_interview_year = sum(is.na(interview_year))
+)
+
+# uniqueness: exactly one row per family_id per wave
+panel %>%
+  count(wave, family_id, name="n") %>%
+  filter(n > 1)
+
+# required columns present
+stopifnot(all(c("family_id","wave","interview_year") %in% names(panel)))
+
+# no missing keys
+panel %>% summarise(
+  n = n(),
+  miss_family_id = sum(is.na(family_id)),
+  miss_wave = sum(is.na(wave)),
+  miss_interview_year = sum(is.na(interview_year))
+)
+
+# uniqueness: exactly one row per family_id per wave
+panel %>%
+  count(wave, family_id, name="n") %>%
+  filter(n > 1)
+panel %>%
+  group_by(wave) %>%
+  summarise(
+    min_id = min(family_id, na.rm=TRUE),
+    max_id = max(family_id, na.rm=TRUE),
+    n_zero = sum(family_id == 0, na.rm=TRUE),
+    n_neg  = sum(family_id < 0, na.rm=TRUE)
+  )
+
+panel %>% summarise(
+  head_age_min = min(head_age, na.rm=TRUE),
+  head_age_max = max(head_age, na.rm=TRUE),
+  spouse_age_min = min(spouse_age, na.rm=TRUE),
+  spouse_age_max = max(spouse_age, na.rm=TRUE)
+)
+
+# flags/codes shouldn't be wild
+panel %>% count(`WTR DONATION>25 TO CHARITY`, sort=TRUE)
+panel %>% count(`WTR DONATED TO RELIGIOUS ORGANIZATION`, sort=TRUE)
+
+
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+
+ages_long <- panel %>%
+  select(wave, head_age, spouse_age) %>%
+  pivot_longer(cols = c(head_age, spouse_age),
+               names_to = "role",
+               values_to = "age") %>%
+  filter(is.finite(age))
+
+ggplot(ages_long, aes(x = age)) +
+  geom_histogram(bins = 60) +
+  facet_grid(role ~ wave) +
+  labs(title = "Age distribution by role and wave", x = "Age", y = "Count")
+
+find_income_like <- function(fam_df,
+                             min_share_pos = 0.30,
+                             min_p90 = 5000,
+                             max_p99 = 5e6) {
+  cands <- names(fam_df)[str_detect(names(fam_df), "^ER\\d+$")]
+
+  scored <- map_dfr(cands, function(v) {
+    x <- suppressWarnings(as.numeric(fam_df[[v]]))
+    x <- x[is.finite(x)]
+    if (length(x) < 500) return(NULL)
+
+    tibble(
+      var = v,
+      n = length(x),
+      share_pos = mean(x > 0),
+      med = median(x),
+      p90 = as.numeric(quantile(x, 0.90)),
+      p99 = as.numeric(quantile(x, 0.99)),
+      max = max(x)
+    )
+  })
+
+  scored %>%
+    filter(
+      share_pos >= min_share_pos,
+      p90 >= min_p90,
+      p99 <= max_p99
+    ) %>%
+    arrange(desc(share_pos), desc(p90)) %>%
+    slice_head(n = 25)
+}
+
+
+```
+
+```{r graphs}
+# change total_household_earnings to your earnings var name
+earn_var <- "total_household_earnings"
+
+names(panel)[stringr::str_detect(names(panel), "RELIG")]
+
+library(dplyr)
+library(ggplot2)
+
+rel_var <- "DOLLAR AMT OF RELIGIOUS DONATIONS"  # change if the name differs
+
+panel %>%
+  filter(!is.na(.data[[rel_var]]), is.finite(.data[[rel_var]]), .data[[rel_var]] >= 0) %>%
+  ggplot(aes(x = .data[[rel_var]])) +
+  geom_histogram(bins = 60) +
+  scale_x_continuous(trans = "log1p") +
+  facet_wrap(~wave) +
+  labs(
+    title = "Religious donations distribution by wave (log1p scale)",
+    x = "Donation amount (log1p)",
+    y = "Count"
+  )
+
+panel %>%
+  filter(!is.na(.data[[rel_var]]), is.finite(.data[[rel_var]]), .data[[rel_var]] >= 0) %>%
+  mutate(wave = factor(wave, levels = sort(unique(wave))),
+         x = log1p(.data[[rel_var]])) %>%
+  ggplot(aes(x = wave, y = x)) +
+  geom_boxplot(outlier_alpha = 0.15) +
+  labs(
+    title = "Religious donations by wave",
+    x = "Wave",
+    y = "log1p(Donation amount)"
+  )
+panel %>%
+  filter(!is.na(.data[[rel_var]]), is.finite(.data[[rel_var]]), .data[[rel_var]] >= 0) %>%
+  mutate(wave = factor(wave),
+         x = log1p(.data[[rel_var]])) %>%
+  ggplot(aes(x = x, group = wave)) +
+  geom_density(alpha = 0.25) +
+  labs(
+    title = "Distribution of religious donations across waves",
+    x = "log1p(Donation amount)",
+    y = "Density"
+  )
+
+```

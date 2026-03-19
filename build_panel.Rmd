@@ -1,0 +1,359 @@
+---
+title: "Build PSID Family-Year Panel (2001–2021)"
+output: html_document
+---
+
+```{r setup, message=FALSE}
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(readr)
+  library(arrow)
+  library(glue)
+  library(stringr)
+  library(fs)
+  library(here)
+})
+
+DATA_DIR  <- here("data_raw")
+XWALK_DIR <- here("xwalk")
+OUT_PATH  <- here("output", "psid_family_year_2001_latest.parquet")
+WAVES     <- c(2001, 2003, 2005, 2007, 2009, 2011, 2013, 2015,
+               2017, 2019, 2021)
+
+dir_create(path_dir(OUT_PATH))
+```
+
+```{r dictionary_parsers}
+# ---- Parse SPSS .sps dictionary for column positions ----
+parse_sps_positions <- function(dict_path) {
+  lines <- read_lines(dict_path)
+  dl <- which(str_detect(lines, regex("^\\s*DATA\\s+LIST", ignore_case = TRUE)))
+  if (!length(dl))
+    return(tibble(var = character(), start = integer(),
+                  end = integer(), width = integer(),
+                  type = character()))
+
+  after <- lines[seq(dl[1], length(lines))]
+  stop_idx <- which(str_detect(
+    after, regex("^\\s*VARIABLE\\s+LABELS", ignore_case = TRUE)
+  ))
+  if (length(stop_idx)) after <- after[seq(1, stop_idx[1] - 1)]
+
+  after <- gsub("\\t", " ", after)
+  after <- gsub("\\*.*$", "", after)
+  after <- str_squish(after)
+  after <- after[after != ""]
+  sl <- which(str_detect(after, "^/"))
+  if (length(sl)) after <- after[seq(sl[1], length(after))]
+
+  blob <- paste(after, collapse = " ")
+  m <- str_match_all(
+    blob,
+    "(?i)\\b([A-Za-z0-9_]+)\\s+(\\d+)\\s*-\\s*(\\d+)\\s*(\\([aA]\\))?"
+  )[[1]]
+  if (!nrow(m))
+    return(tibble(var = character(), start = integer(),
+                  end = integer(), width = integer(),
+                  type = character()))
+
+  tibble(
+    var   = m[, 2],
+    start = as.integer(m[, 3]),
+    end   = as.integer(m[, 4]),
+    type  = ifelse(!is.na(m[, 5]) & m[, 5] != "",
+                   "character", "numeric")
+  ) |>
+    mutate(width = end - start + 1L) |>
+    distinct(var, .keep_all = TRUE) |>
+    arrange(start)
+}
+
+# ---- Read a fixed-width PSID data file using .sps dictionary ----
+read_psid_fwf <- function(stem) {
+  txt  <- path(DATA_DIR, paste0(stem, ".txt"))
+  sps  <- path(DATA_DIR, paste0(stem, ".sps"))
+  if (!file_exists(txt)) { warning(glue("Missing {stem}.txt")); return(tibble()) }
+  if (!file_exists(sps)) { warning(glue("Missing {stem}.sps")); return(tibble()) }
+
+  dict <- parse_sps_positions(sps)
+  if (!nrow(dict)) { warning(glue("No positions in {stem}.sps")); return(tibble()) }
+
+  col_types <- paste(ifelse(dict$type == "character", "c", "d"),
+                     collapse = "")
+  readr::read_fwf(
+    file          = txt,
+    col_positions = readr::fwf_positions(dict$start, dict$end, dict$var),
+    col_types     = col_types,
+    na            = c("", " ", ".", "NA")
+  )
+}
+```
+
+```{r crosswalk_loader}
+# ---- Load and validate crosswalk CSVs ----
+load_xwalk <- function(fname) {
+  p <- path(XWALK_DIR, fname)
+  if (!file_exists(p)) {
+    warning(glue("Crosswalk not found: {fname}"))
+    return(tibble(wave = integer(), varname = character(),
+                  source = character()))
+  }
+  out <- read_csv(p, show_col_types = FALSE)
+  # Keep only the 3 required columns (ignore extras)
+  names(out) <- tolower(trimws(names(out)))
+  out <- out |> select(any_of(c("wave", "varname", "source")))
+  needed <- c("wave", "varname", "source")
+  if (!all(needed %in% names(out))) {
+    warning(glue("{fname}: missing columns {paste(setdiff(needed, names(out)), collapse=', ')}"))
+    return(tibble(wave = integer(), varname = character(),
+                  source = character()))
+  }
+  out <- out |>
+    mutate(wave = as.integer(wave)) |>
+    filter(!is.na(source), source != "")
+
+  # Check for duplicate (wave, varname) — would corrupt column names
+  dups <- out |> count(wave, varname) |> filter(n > 1)
+  if (nrow(dups)) {
+    warning(glue(
+      "{fname}: duplicate (wave, varname) entries — keeping first:\n",
+      paste(capture.output(print(dups)), collapse = "\n")
+    ))
+    out <- out |> distinct(wave, varname, .keep_all = TRUE)
+  }
+
+  # Check for duplicate (wave, source) — same ER code for two names
+
+  dup_src <- out |> count(wave, source) |> filter(n > 1)
+  if (nrow(dup_src)) {
+    warning(glue(
+      "{fname}: duplicate (wave, source) entries — keeping first:\n",
+      paste(capture.output(print(dup_src)), collapse = "\n")
+    ))
+    out <- out |> distinct(wave, source, .keep_all = TRUE)
+  }
+
+  out
+}
+
+# Load all crosswalks
+family_xw <- load_xwalk("family_vars_crosswalk.csv")
+hs_xw     <- load_xwalk("head_spouse_crosswalk.csv")
+phil_xw   <- load_xwalk("philanthropy_crosswalk.csv")
+mob_xw    <- load_xwalk("mobility_crosswalk.csv")
+state_xw  <- load_xwalk("state_crosswalk.csv")
+relig_xw  <- load_xwalk("religiosity_crosswalk.csv")
+
+cat("Crosswalks loaded.\n")
+```
+
+```{r apply_xwalk_fn}
+# ---- Map raw ER codes → human-readable names via crosswalk ----
+# Returns a tibble with renamed columns, or empty tibble if
+# no matching columns found. Logs what's missing.
+apply_xwalk <- function(df, xw, yr, label = "") {
+  if (!nrow(df) || !nrow(xw)) return(tibble())
+
+  xwy <- xw |> filter(wave == yr)
+  if (!nrow(xwy)) return(tibble())
+
+  found   <- xwy |> filter(source %in% names(df))
+  missing <- xwy |> filter(!source %in% names(df))
+
+  if (nrow(missing) && nchar(label)) {
+    cat(glue("  {label} wave {yr}: missing {nrow(missing)} vars: ",
+             "{paste(missing$source, collapse=', ')}\n\n"))
+  }
+
+  if (!nrow(found)) return(tibble())
+
+  # Select columns in the order they appear in the crosswalk
+  out <- select(df, all_of(found$source))
+  names(out) <- found$varname
+  out
+}
+```
+
+```{r build_wave_fn}
+# ---- Build a single wave of the panel ----
+build_wave <- function(yr) {
+  cat(glue("=== Wave {yr} ===\n"))
+  fam <- read_psid_fwf(glue("FAM{yr}ER"))
+  if (!nrow(fam)) return(tibble())
+
+  # 1. Get the 1968 Family ID (stable panel key), interview number, and year
+  id68_src <- family_xw |>
+    filter(wave == yr, varname == "id_1968") |>
+    pull(source) |>
+    first()
+  fid_src <- family_xw |>
+    filter(wave == yr, varname == "family_id") |>
+    pull(source) |>
+    first()
+  iyr_src <- family_xw |>
+    filter(wave == yr, varname == "interview_year") |>
+    pull(source) |>
+    first()
+
+  if (is.na(id68_src) || !id68_src %in% names(fam))
+    stop(glue("Wave {yr}: no id_1968 mapping"))
+  if (is.na(fid_src) || !fid_src %in% names(fam))
+    stop(glue("Wave {yr}: no family_id mapping"))
+  if (is.na(iyr_src) || !iyr_src %in% names(fam))
+    stop(glue("Wave {yr}: no interview_year mapping"))
+
+  keys <- tibble(
+    id_1968        = as.integer(fam[[id68_src]]),
+    family_id      = as.integer(fam[[fid_src]]),
+    interview_year = as.integer(fam[[iyr_src]]),
+    wave           = as.integer(yr)
+  )
+
+  # 2. Apply each crosswalk domain
+  safe_add <- function(base, piece) {
+    if (is.null(piece) || !ncol(piece)) return(base)
+    # Guard against duplicate column names from overlapping xwalks
+    dupes <- intersect(names(base), names(piece))
+    if (length(dupes)) piece <- piece |> select(-all_of(dupes))
+    bind_cols(base, piece)
+  }
+
+  out <- keys |>
+    safe_add(apply_xwalk(fam, hs_xw,    yr, "head_spouse")) |>
+    safe_add(apply_xwalk(fam, phil_xw,  yr, "philanthropy")) |>
+    safe_add(apply_xwalk(fam, mob_xw,   yr, "mobility")) |>
+    safe_add(apply_xwalk(fam, state_xw, yr, "state")) |>
+    safe_add(apply_xwalk(fam, relig_xw, yr, "religiosity"))
+
+  # 3. Validate: one row per family per wave
+  #    Use id_1968 as the primary key — but note that splitoff families
+  #    share the same id_1968, so we check (id_1968, family_id) uniqueness.
+  n_dup <- sum(duplicated(out$family_id))
+  if (n_dup > 0)
+    stop(glue("Wave {yr}: {n_dup} duplicate family_id rows"))
+
+  cat(glue("  {nrow(out)} families, {ncol(out)} columns\n\n"))
+  out
+}
+```
+
+```{r run_all_waves}
+# ---- Build panel across all waves ----
+panel <- map_dfr(WAVES, build_wave)
+
+cat("\n=== PRE-DEDUP PANEL ===\n")
+cat("Total rows:", nrow(panel), "\n")
+cat("Unique id_1968 values:", n_distinct(panel$id_1968), "\n")
+cat("Unique family_id:", n_distinct(panel$family_id), "\n\n")
+
+# --- Splitoff deduplication ---
+# Within each (id_1968, wave), multiple families can exist (splitoffs).
+# Keep the family with the oldest head (the original household).
+n_before <- nrow(panel)
+panel <- panel |>
+  group_by(id_1968, wave) |>
+  slice_max(head_age, n = 1, with_ties = FALSE) |>
+  ungroup()
+
+cat("Splitoff dedup: removed",
+    n_before - nrow(panel), "rows (",
+    round(100 * (n_before - nrow(panel)) / n_before, 1), "%)\n")
+
+cat("\n=== PANEL SUMMARY ===\n")
+cat("Total rows:", nrow(panel), "\n")
+cat("Total columns:", ncol(panel), "\n")
+cat("Unique id_1968 values:", n_distinct(panel$id_1968), "\n")
+cat("Unique family_id:", n_distinct(panel$family_id), "\n")
+cat("Waves:", paste(sort(unique(panel$wave)), collapse = ", "), "\n\n")
+
+# Distribution of waves per lineage
+wpf <- table(table(panel$id_1968))
+cat("Waves-per-id_1968 distribution:\n")
+print(wpf)
+```
+
+```{r validate}
+# ---- Validate the panel ----
+
+# 1. No duplicate (id_1968, wave) rows
+#    NOTE: splitoff families share id_1968, so duplicates here
+#    mean multiple families from the same 1968 lineage in one wave.
+dups_68 <- panel |> count(id_1968, wave) |> filter(n > 1)
+if (nrow(dups_68)) {
+  cat("NOTE:", nrow(dups_68), "id_1968 values appear >1 time in a wave",
+      "(splitoffs).\n")
+  cat("  These will be collapsed or handled in analysis.\n")
+} else {
+  cat("OK: No duplicate (id_1968, wave) rows.\n")
+}
+
+# Also check family_id uniqueness within wave (should always hold)
+dups_fid <- panel |> count(family_id, wave) |> filter(n > 1)
+if (nrow(dups_fid)) {
+  print(dups_fid, n = 20)
+  stop("Panel has duplicate (family_id, wave) rows.")
+} else {
+  cat("OK: No duplicate (family_id, wave) rows.\n")
+}
+
+# 2. No missing keys
+cat("Missing id_1968:", sum(is.na(panel$id_1968)), "\n")
+cat("Missing family_id:", sum(is.na(panel$family_id)), "\n")
+cat("Missing wave:", sum(is.na(panel$wave)), "\n")
+cat("Missing interview_year:",
+    sum(is.na(panel$interview_year)), "\n\n")
+
+# 3. Check that key analysis variables are present
+expected_vars <- c(
+  "id_1968", "family_id", "wave", "interview_year",
+  "head_age", "Religious_Preference",
+  "WHY MOVED 1ST",
+  "DOLLAR AMT OF RELIGIOUS DONATIONS",
+  "DOLLAR AMT OF NEEDY DONATIONS",
+  "DOLLAR AMT OF HEALTH DONATIONS",
+  "DOLLAR AMT OF EDUCATION DONATIONS",
+  "Current State"
+)
+present <- expected_vars[expected_vars %in% names(panel)]
+absent  <- expected_vars[!expected_vars %in% names(panel)]
+cat("Analysis variables present:", length(present), "/",
+    length(expected_vars), "\n")
+if (length(absent))
+  cat("  MISSING:", paste(absent, collapse = ", "), "\n")
+
+# 4. Check no suffixed duplicates (the old bug)
+suffixed <- names(panel)[str_detect(names(panel), "\\.\\.\\.[0-9]+$")]
+if (length(suffixed)) {
+  cat("\nWARNING: Suffixed column names detected ",
+      "(likely crosswalk duplicates):\n")
+  cat(" ", paste(suffixed, collapse = "\n  "), "\n")
+} else {
+  cat("OK: No suffixed duplicate columns.\n")
+}
+
+# 5. Spot-check dollar amounts for sentinel codes
+dollar_cols <- names(panel)[str_detect(names(panel), "DOLLAR AMT")]
+for (dc in dollar_cols) {
+  n_sentinel <- sum(panel[[dc]] >= 999997, na.rm = TRUE)
+  if (n_sentinel > 0)
+    cat(glue("  NOTE: {dc} has {n_sentinel} sentinel values ",
+             "(>=999997) — clean in analysis\n\n"))
+}
+
+cat("\nValidation complete.\n")
+```
+
+```{r write_output}
+# ---- Write the panel ----
+panel <- panel |>
+  filter(!is.na(id_1968), !is.na(wave)) |>
+  arrange(id_1968, wave) |>
+  relocate(id_1968, family_id, interview_year, wave)
+
+write_parquet(panel, OUT_PATH)
+cat(glue("Wrote: {OUT_PATH}\n"))
+cat(glue("  {nrow(panel)} rows × {ncol(panel)} columns\n"))
+cat(glue("  Waves: {paste(sort(unique(panel$wave)),
+         collapse=', ')}\n"))
+```
+
