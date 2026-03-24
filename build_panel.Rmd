@@ -181,7 +181,7 @@ build_wave <- function(yr) {
   fam <- read_psid_fwf(glue("FAM{yr}ER"))
   if (!nrow(fam)) return(tibble())
 
-  # 1. Get the 1968 Family ID (stable panel key), interview number, and year
+  # 1. Get the 1968 Family ID, interview number, year, and weight
   id68_src <- family_xw |>
     filter(wave == yr, varname == "id_1968") |>
     pull(source) |>
@@ -194,6 +194,10 @@ build_wave <- function(yr) {
     filter(wave == yr, varname == "interview_year") |>
     pull(source) |>
     first()
+  wgt_src <- family_xw |>
+    filter(wave == yr, varname == "family_weight") |>
+    pull(source) |>
+    first()
 
   if (is.na(id68_src) || !id68_src %in% names(fam))
     stop(glue("Wave {yr}: no id_1968 mapping"))
@@ -201,12 +205,16 @@ build_wave <- function(yr) {
     stop(glue("Wave {yr}: no family_id mapping"))
   if (is.na(iyr_src) || !iyr_src %in% names(fam))
     stop(glue("Wave {yr}: no interview_year mapping"))
+  if (is.na(wgt_src) || !wgt_src %in% names(fam))
+    warning(glue("Wave {yr}: no family_weight mapping — weight will be NA"))
 
   keys <- tibble(
     id_1968        = as.integer(fam[[id68_src]]),
     family_id      = as.integer(fam[[fid_src]]),
     interview_year = as.integer(fam[[iyr_src]]),
-    wave           = as.integer(yr)
+    wave           = as.integer(yr),
+    family_weight  = if (!is.na(wgt_src) && wgt_src %in% names(fam))
+                       fam[[wgt_src]] else NA_real_
   )
 
   # 2. Apply each crosswalk domain
@@ -241,53 +249,38 @@ build_wave <- function(yr) {
 # ---- Build panel across all waves ----
 panel <- map_dfr(WAVES, build_wave)
 
-cat("\n=== PRE-DEDUP PANEL ===\n")
-cat("Total rows:", nrow(panel), "\n")
-cat("Unique id_1968 values:", n_distinct(panel$id_1968), "\n")
-cat("Unique family_id:", n_distinct(panel$family_id), "\n\n")
-
-# --- Splitoff deduplication ---
-# Within each (id_1968, wave), multiple families can exist (splitoffs).
-# Keep the family with the oldest head (the original household).
-n_before <- nrow(panel)
-panel <- panel |>
-  group_by(id_1968, wave) |>
-  slice_max(head_age, n = 1, with_ties = FALSE) |>
-  ungroup()
-
-cat("Splitoff dedup: removed",
-    n_before - nrow(panel), "rows (",
-    round(100 * (n_before - nrow(panel)) / n_before, 1), "%)\n")
-
-cat("\n=== PANEL SUMMARY ===\n")
+cat("\n=== PANEL SUMMARY (all families, including splitoffs) ===\n")
 cat("Total rows:", nrow(panel), "\n")
 cat("Total columns:", ncol(panel), "\n")
 cat("Unique id_1968 values:", n_distinct(panel$id_1968), "\n")
 cat("Unique family_id:", n_distinct(panel$family_id), "\n")
 cat("Waves:", paste(sort(unique(panel$wave)), collapse = ", "), "\n\n")
 
-# Distribution of waves per lineage
-wpf <- table(table(panel$id_1968))
-cat("Waves-per-id_1968 distribution:\n")
+# Splitoff summary (informational only — we keep all families)
+splitoff_counts <- panel |>
+  group_by(id_1968, wave) |>
+  summarise(n_fams = n(), .groups = "drop") |>
+  filter(n_fams > 1)
+cat("Splitoff lineages (id_1968 with >1 family in a wave):",
+    n_distinct(splitoff_counts$id_1968), "\n")
+cat("Total splitoff rows:", sum(splitoff_counts$n_fams), "\n\n")
+
+# Weight summary
+cat("Family weight summary:\n")
+cat("  Non-zero weights:", sum(panel$family_weight > 0, na.rm = TRUE), "\n")
+cat("  Zero weights:", sum(panel$family_weight == 0, na.rm = TRUE), "\n")
+cat("  NA weights:", sum(is.na(panel$family_weight)), "\n\n")
+
+# Distribution of waves per family_id
+wpf <- table(table(panel$family_id))
+cat("Waves-per-family_id distribution:\n")
 print(wpf)
 ```
 
 ```{r validate}
 # ---- Validate the panel ----
 
-# 1. No duplicate (id_1968, wave) rows
-#    NOTE: splitoff families share id_1968, so duplicates here
-#    mean multiple families from the same 1968 lineage in one wave.
-dups_68 <- panel |> count(id_1968, wave) |> filter(n > 1)
-if (nrow(dups_68)) {
-  cat("NOTE:", nrow(dups_68), "id_1968 values appear >1 time in a wave",
-      "(splitoffs).\n")
-  cat("  These will be collapsed or handled in analysis.\n")
-} else {
-  cat("OK: No duplicate (id_1968, wave) rows.\n")
-}
-
-# Also check family_id uniqueness within wave (should always hold)
+# 1. Check family_id uniqueness within wave (must always hold)
 dups_fid <- panel |> count(family_id, wave) |> filter(n > 1)
 if (nrow(dups_fid)) {
   print(dups_fid, n = 20)
@@ -295,6 +288,11 @@ if (nrow(dups_fid)) {
 } else {
   cat("OK: No duplicate (family_id, wave) rows.\n")
 }
+
+# Note: id_1968 can repeat within a wave (splitoffs) — that's expected
+dups_68 <- panel |> count(id_1968, wave) |> filter(n > 1)
+cat("INFO:", nrow(dups_68), "id_1968 values appear >1 time in a wave",
+    "(splitoffs — expected).\n")
 
 # 2. No missing keys
 cat("Missing id_1968:", sum(is.na(panel$id_1968)), "\n")
@@ -306,6 +304,7 @@ cat("Missing interview_year:",
 # 3. Check that key analysis variables are present
 expected_vars <- c(
   "id_1968", "family_id", "wave", "interview_year",
+  "family_weight",
   "head_age", "Religious_Preference",
   "WHY MOVED 1ST",
   "DOLLAR AMT OF RELIGIOUS DONATIONS",
@@ -347,8 +346,8 @@ cat("\nValidation complete.\n")
 # ---- Write the panel ----
 panel <- panel |>
   filter(!is.na(id_1968), !is.na(wave)) |>
-  arrange(id_1968, wave) |>
-  relocate(id_1968, family_id, interview_year, wave)
+  arrange(id_1968, family_id, wave) |>
+  relocate(id_1968, family_id, interview_year, wave, family_weight)
 
 write_parquet(panel, OUT_PATH)
 cat(glue("Wrote: {OUT_PATH}\n"))
