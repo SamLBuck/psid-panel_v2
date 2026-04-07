@@ -46,12 +46,24 @@ cat("Donation columns found:", length(available_donation_cols), "\n")
 cat("  ", paste(available_donation_cols, collapse = "\n   "), "\n\n")
 
 # 2b. Build analysis dataset
-#     First, clean PSID sentinel codes from dollar amounts:
-#     999997 = "Other", 999998 = "Don't Know", 999999 = "NA/Refused"
+#     Clean PSID sentinel codes from dollar amounts:
+#     Religious donations use 6+ digit sentinels (999997+)
+#     Needy/Health/Education use 5-digit sentinels (99997+)
+nonrelig_cols <- c(
+  "DOLLAR AMT OF NEEDY DONATIONS",
+  "DOLLAR AMT OF HEALTH DONATIONS",
+  "DOLLAR AMT OF EDUCATION DONATIONS"
+)
+relig_cols <- "DOLLAR AMT OF RELIGIOUS DONATIONS"
+
 analysis <- panel |>
   mutate(
     across(
-      all_of(available_donation_cols),
+      any_of(nonrelig_cols),
+      ~ if_else(.x >= 99997, NA_real_, .x)
+    ),
+    across(
+      any_of(relig_cols),
       ~ if_else(.x >= 999997, NA_real_, .x)
     )
   ) |>
@@ -104,16 +116,16 @@ analysis <- panel |>
 cat("After dropping zero/NA weights:", nrow(analysis), "rows\n")
 
 # --- Lagged religiosity (pre-move moderator) ---
-# Use family_id for lag since splitoffs are separate families
+# Use id_1968 for lag — family_id is recycled across waves
+# (different family gets same interview number each wave)
 analysis <- analysis |>
-  arrange(family_id, wave) |>
-  group_by(family_id) |>
+  arrange(id_1968, wave) |>
+  group_by(id_1968) |>
   mutate(religious_lag = lag(religious, order_by = wave)) |>
   ungroup()
 
 cat("\nAnalysis dataset:", nrow(analysis),
     "family-wave observations\n")
-cat("Unique family_id:", n_distinct(analysis$family_id), "\n")
 cat("Unique id_1968 lineages:",
     n_distinct(analysis$id_1968), "\n")
 cat("Movers:", sum(analysis$moved == 1, na.rm = TRUE), "(",
@@ -144,11 +156,12 @@ print(desc_table)
 
 ```{r models}
 # ---- 4. Fixed effects regression (weighted) ----
-# family_id FE absorbs time-invariant family characteristics
+# id_1968 FE absorbs time-invariant lineage characteristics
 # wave FE absorbs macro trends in giving
 # Weights = PSID longitudinal family weights
 # religious_lag = religiosity from the PRIOR wave (pre-move)
 #   — avoids endogeneity from moving changing religious ID
+# NOTE: family_id is recycled across waves so cannot be used for FE
 
 # Subset with non-missing lagged religiosity
 analysis_lag <- analysis |>
@@ -158,13 +171,13 @@ cat("Lagged-religion sample:", nrow(analysis_lag),
     "obs (first wave of each family dropped)\n\n")
 
 # Model 1: Does moving reduce giving?
-m1 <- feols(log_giving ~ moved | family_id + wave,
+m1 <- feols(log_giving ~ moved | id_1968 + wave,
             data = analysis_lag,
             weights = ~family_weight)
 
 # Model 2: Does PRE-MOVE religiosity moderate the effect?
 m2 <- feols(
-  log_giving ~ moved * religious_lag | family_id + wave,
+  log_giving ~ moved * religious_lag | id_1968 + wave,
   data = analysis_lag,
   weights = ~family_weight
 )
@@ -172,7 +185,7 @@ m2 <- feols(
 # Model 3: Add age controls
 m3 <- feols(
   log_giving ~ moved * religious_lag + age + age2 |
-    family_id + wave,
+    id_1968 + wave,
   data = analysis_lag,
   weights = ~family_weight
 )
