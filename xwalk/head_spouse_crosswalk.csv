@@ -10,6 +10,17 @@ wave,varname,source,,,,
 2017,head_age,ER66017,,2003,spouse_race,ER23334
 2019,head_age,ER72017,,2003,head_ethnicity,ER23430
 2021,head_age,ER78017,,2003,spouse_ethnicity,ER23338
+2001,head_sex,ER17014,,,,
+2003,head_sex,ER21018,,,,
+2005,head_sex,ER25018,,,,
+2007,head_sex,ER36018,,,,
+2009,head_sex,ER42018,,,,
+2011,head_sex,ER47318,,,,
+2013,head_sex,ER53018,,,,
+2015,head_sex,ER60018,,,,
+2017,head_sex,ER66018,,,,
+2019,head_sex,ER72018,,,,
+2021,head_sex,ER78018,,,,
 2001,head_race,ER19989,,,,
 2003,head_race,ER23426,,,,
 2005,head_race,ER27393,,,,

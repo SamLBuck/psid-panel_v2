@@ -98,10 +98,17 @@ analysis <- panel |>
 
     # --- Controls ---
     age = as.numeric(head_age),
-    age2 = age^2
+    age2 = age^2,
+
+    # --- Longitudinal family key ---
+    # family_id is recycled across waves (useless for tracking).
+    # Construct a composite key: id_1968 + head birth year + sex
+    # to uniquely identify the same family across waves.
+    birth_year = wave - age,
+    family_key = paste(id_1968, birth_year, head_sex, sep = "_")
   ) |>
   select(
-    id_1968, family_id, wave, interview_year,
+    id_1968, family_id, family_key, wave, interview_year,
     family_weight,
     total_giving, log_giving,
     moved, religious,
@@ -113,19 +120,27 @@ analysis <- panel |>
   filter(!is.na(id_1968), !is.na(religious),
          !is.na(family_weight), family_weight > 0)
 
-cat("After dropping zero/NA weights:", nrow(analysis), "rows\n")
+# Deduplicate: if two families share the same key in a wave
+# (e.g., same-sex twins from same lineage), keep oldest head
+n_pre <- nrow(analysis)
+analysis <- analysis |>
+  group_by(family_key, wave) |>
+  slice_max(age, n = 1, with_ties = FALSE) |>
+  ungroup()
+cat("After dedup:", nrow(analysis), "of", n_pre,
+    "rows (dropped", n_pre - nrow(analysis), ")\n")
 
 # --- Lagged religiosity (pre-move moderator) ---
-# Use id_1968 for lag — family_id is recycled across waves
-# (different family gets same interview number each wave)
+# family_key uniquely tracks a family across waves
 analysis <- analysis |>
-  arrange(id_1968, wave) |>
-  group_by(id_1968) |>
+  arrange(family_key, wave) |>
+  group_by(family_key) |>
   mutate(religious_lag = lag(religious, order_by = wave)) |>
   ungroup()
 
 cat("\nAnalysis dataset:", nrow(analysis),
     "family-wave observations\n")
+cat("Unique family_key:", n_distinct(analysis$family_key), "\n")
 cat("Unique id_1968 lineages:",
     n_distinct(analysis$id_1968), "\n")
 cat("Movers:", sum(analysis$moved == 1, na.rm = TRUE), "(",
@@ -156,12 +171,12 @@ print(desc_table)
 
 ```{r models}
 # ---- 4. Fixed effects regression (weighted) ----
-# id_1968 FE absorbs time-invariant lineage characteristics
+# family_key FE absorbs time-invariant family characteristics
+# (composite key: id_1968 + head birth year + sex)
 # wave FE absorbs macro trends in giving
 # Weights = PSID longitudinal family weights
 # religious_lag = religiosity from the PRIOR wave (pre-move)
 #   — avoids endogeneity from moving changing religious ID
-# NOTE: family_id is recycled across waves so cannot be used for FE
 
 # Subset with non-missing lagged religiosity
 analysis_lag <- analysis |>
@@ -171,13 +186,13 @@ cat("Lagged-religion sample:", nrow(analysis_lag),
     "obs (first wave of each family dropped)\n\n")
 
 # Model 1: Does moving reduce giving?
-m1 <- feols(log_giving ~ moved | id_1968 + wave,
+m1 <- feols(log_giving ~ moved | family_key + wave,
             data = analysis_lag,
             weights = ~family_weight)
 
 # Model 2: Does PRE-MOVE religiosity moderate the effect?
 m2 <- feols(
-  log_giving ~ moved * religious_lag | id_1968 + wave,
+  log_giving ~ moved * religious_lag | family_key + wave,
   data = analysis_lag,
   weights = ~family_weight
 )
@@ -185,7 +200,7 @@ m2 <- feols(
 # Model 3: Add age controls
 m3 <- feols(
   log_giving ~ moved * religious_lag + age + age2 |
-    id_1968 + wave,
+    family_key + wave,
   data = analysis_lag,
   weights = ~family_weight
 )
@@ -253,7 +268,7 @@ ggplot(desc_plot, aes(x = Moved, y = mean_giving, fill = Religious)) +
     subtitle = "PSID 2003-2021 (weighted, lagged religiosity sample)",
     x = NULL, y = "Weighted mean total giving ($)",
     fill = NULL
-  ) +
+  ) 
   theme_minimal(base_size = 13) +
   theme(legend.position = "top")
 
@@ -305,6 +320,101 @@ ggplot(desc_by_year,
 
 ggsave(file.path(PLOT_DIR, "descriptive_giving_by_group_year.png"),
        width = 14, height = 10, dpi = 300)
+```
+
+```{r plot_event_time, fig.width=8, fig.height=5}
+# ---- 6c. Event-time plot around the first observed move ----
+# For a cleaner descriptive event window, focus on families with exactly
+# one observed move and at least one pre- and post-move wave. Each
+# family's giving is indexed to the prior wave (t = -2).
+first_move_families <- analysis |>
+  filter(!is.na(religious_lag), !is.na(moved)) |>
+  group_by(family_key) |>
+  summarise(
+    move_count = sum(moved == 1, na.rm = TRUE),
+    first_move_wave = ifelse(
+      any(moved == 1, na.rm = TRUE),
+      min(wave[moved == 1], na.rm = TRUE),
+      NA_real_
+    ),
+    pre_obs = sum(wave < first_move_wave, na.rm = TRUE),
+    post_obs = sum(wave > first_move_wave, na.rm = TRUE),
+    pre_move_religious = religious_lag[match(first_move_wave, wave)],
+    baseline_log_giving = log_giving[match(first_move_wave - 2, wave)],
+    .groups = "drop"
+  ) |>
+  filter(
+    move_count == 1,
+    pre_obs >= 1,
+    post_obs >= 1,
+    !is.na(pre_move_religious),
+    !is.na(baseline_log_giving)
+  )
+
+event_sample <- analysis |>
+  filter(!is.na(religious_lag), !is.na(moved)) |>
+  inner_join(
+    first_move_families |>
+      select(family_key, first_move_wave,
+             pre_move_religious, baseline_log_giving),
+    by = "family_key"
+  ) |>
+  mutate(
+    event_time = wave - first_move_wave,
+    change_from_pre_move = log_giving - baseline_log_giving,
+    Religious = factor(
+      pre_move_religious,
+      levels = c(0, 1),
+      labels = c("Not religious", "Religious")
+    )
+  ) |>
+  filter(event_time %in% c(-4, -2, 0, 2, 4))
+
+event_summary <- event_sample |>
+  group_by(event_time, Religious) |>
+  summarise(
+    mean_change = weighted.mean(change_from_pre_move,
+                                family_weight, na.rm = TRUE),
+    n_families = n_distinct(family_key),
+    .groups = "drop"
+  )
+
+n_event_families <- n_distinct(event_sample$family_key)
+
+event_time_plot <- ggplot(
+  event_summary,
+  aes(x = event_time, y = mean_change,
+      colour = Religious, group = Religious)
+) +
+  geom_hline(yintercept = 0, linetype = "dashed", colour = "grey60") +
+  geom_vline(xintercept = 0, linetype = "dotted", colour = "grey50") +
+  geom_line(linewidth = 0.9) +
+  geom_point(size = 2.5) +
+  scale_colour_manual(values = c("#7f8c8d", "#2980b9")) +
+  scale_x_continuous(
+    breaks = c(-4, -2, 0, 2, 4),
+    labels = c("-4", "-2", "0", "+2", "+4")
+  ) +
+  labs(
+    title = "Change in Giving Around the First Observed Move",
+    subtitle = paste0(
+      "One-time movers only; indexed to the prior wave (t = -2), ",
+      "N = ", scales::comma(n_event_families), " families"
+    ),
+    x = "Years relative to move",
+    y = "Change in log(giving + 1) relative to t = -2",
+    colour = NULL
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(legend.position = "top")
+
+event_time_plot
+
+ggsave(
+  file.path(PLOT_DIR, "giving_event_time_first_move.png"),
+  plot = event_time_plot,
+  width = 8, height = 5, dpi = 300
+)
 ```
 
 ```{r plot_coefplot, fig.width=7, fig.height=4}
@@ -410,4 +520,3 @@ ggplot(move_rate, aes(x = wave, y = pct_moved,
 ggsave(file.path(PLOT_DIR, "move_rate_by_religiosity.png"),
        width = 7, height = 4, dpi = 300)
 ```
-
