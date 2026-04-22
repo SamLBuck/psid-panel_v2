@@ -348,6 +348,23 @@ panel <- panel |>
   filter(!is.na(id_1968), !is.na(wave)) |>
   arrange(id_1968, family_id, wave) |>
   relocate(id_1968, family_id, interview_year, wave, family_weight)
+  df <- tibble(a = 1, b = 1, c = 1, d = "a", e = "a", f = "a")
+  df %>% relocate(f)
+  df %>% relocate(a, .after = c)
+  df %>% relocate(f, .before = b)
+  df %>% relocate(a, .after = last_col())
+
+  df %>% relocate(ff = f)
+  df %>% relocate(where(is.character))
+  df %>% relocate(where(is.numeric), .after = last_col())
+
+  df %>% relocate(any_of(c("a", "e", "i")))
+
+  df2 <- tibble(a = 1, b = "a", c = 1, d = "a")
+
+  # df2 <- tibble(a = 1, b = "a", c = 1, d = "a")
+
+
 
 write_parquet(panel, OUT_PATH)
 cat(glue("Wrote: {OUT_PATH}\n"))

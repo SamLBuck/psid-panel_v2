@@ -142,6 +142,26 @@ desc_plot <- analysis_lag |>
     .groups = "drop"
   )
 
+desc_by_year <- analysis_lag |>
+  mutate(
+    Moved = factor(
+      moved,
+      levels = c(0, 1),
+      labels = c("Did not move", "Moved")
+    ),
+    Religious = factor(
+      religious_lag,
+      levels = c(0, 1),
+      labels = c("Not religious", "Religious")
+    )
+  ) |>
+  group_by(wave, Moved, Religious) |>
+  summarise(
+    mean_giving = weighted.mean(total_giving, family_weight, na.rm = TRUE),
+    n = n(),
+    .groups = "drop"
+  )
+
 first_move_families <- analysis_lag |>
   group_by(family_key) |>
   summarise(
@@ -288,15 +308,7 @@ The analysis uses `r scales::comma(n_obs)` family-wave observations from `r scal
 - Outcome: total charitable giving, measured as the sum of the available religious, needy, health, and education donation amounts.
 - Treatment: `moved`, a binary indicator derived from the PSID move-reason item.
 - Moderator: `religious_lag`, a lagged indicator for whether the family reported a religious preference in the prior wave.
-- Controls: family fixed effects, wave fixed effects, PSID longitudinal family weights, and a quadratic age profile in the most saturated model.
-
-Lagging religiosity matters here because it helps keep the moderator pre-treatment. In other words, the report asks whether religiosity measured before the move is associated with a smaller drop in giving after the move.
-
-## Empirical Strategy
-
-The main models estimate within-family changes in `log(giving + 1)` using family and wave fixed effects. This means the estimates compare a family to itself over time rather than comparing permanently different families to one another.
-
-The primary moderation test is the interaction between `moved` and `religious_lag`. A positive interaction would be consistent with a buffering story because it would imply that the negative association between moving and giving is smaller for previously religious families.
+- Controls: family fixed effects, wave fixed effects, PSID longitudinal family weights.
 
 ## Results
 
@@ -323,13 +335,39 @@ ggplot(desc_plot, aes(x = Moved, y = mean_giving, fill = Religious)) +
   theme(legend.position = "top")
 ```
 
+The year-by-year version is useful because aggregate averages can hide whether the same broad pattern shows up across waves or is being driven by only a small part of the panel.
+
+```{r fig_descriptive_by_year, fig.cap="Figure 2. Weighted mean charitable giving by move status and pre-move religiosity, by wave.", fig.width=12, fig.height=8}
+ggplot(desc_by_year, aes(x = Moved, y = mean_giving, fill = Religious)) +
+  geom_col(position = position_dodge(width = 0.7), width = 0.6) +
+  geom_text(
+    aes(label = paste0("n=", scales::comma(n))),
+    position = position_dodge(width = 0.7),
+    vjust = -0.5, size = 2.4
+  ) +
+  facet_wrap(~ wave, nrow = 2) +
+  scale_fill_manual(values = c("#7f8c8d", "#2980b9")) +
+  scale_y_continuous(labels = scales::dollar_format()) +
+  labs(
+    x = NULL,
+    y = "Weighted mean total giving ($)",
+    fill = NULL
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    legend.position = "top",
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 8),
+    strip.text = element_text(size = 10, face = "bold")
+  )
+```
+
 ### Event-Time Evidence
 
 The next figure is more informative for the report. It follows families with exactly one observed move and indexes each family to the wave immediately before the move (`t = -2`). This keeps the plot focused on change around the disruption rather than permanent level differences between families.
 
 In this one-time-mover sample (`r scales::comma(n_event_families)` families), the immediate drop at the move wave is descriptively larger for nonreligious families (`r fmt_num(event_drop_nonrelig)`) than for religious families (`r fmt_num(event_drop_relig)`) when both are measured relative to their own pre-move baseline. That pattern is consistent with a buffering story, although it remains descriptive.
 
-```{r fig_event_time, fig.cap="Figure 2. Change in log(giving + 1) around the first observed move, indexed to the prior wave (t = -2). Sample restricted to one-time movers with at least one pre- and post-move observation."}
+```{r fig_event_time, fig.cap="Figure 3. Change in log(giving + 1) around the first observed move, indexed to the prior wave (t = -2). Sample restricted to one-time movers with at least one pre- and post-move observation."}
 ggplot(
   event_summary,
   aes(x = event_time, y = mean_change,
@@ -353,35 +391,24 @@ ggplot(
   theme(legend.position = "top")
 ```
 
-### Fixed-Effects Models
-
-Table 1 reports the main within-family models. The most stable result is that moving is associated with lower charitable giving. In Model 3, the estimated association for nonreligious families is `r fmt_num(m3_moved)` log points. For religious families, the implied association is `r fmt_num(m3_religious_move)` log points after adding the interaction term.
-
-The interaction estimate is positive, which points in the expected direction for a buffering interpretation, but it is not statistically precise in the fixed-effects models (`p = r fmt_num(m3_interaction_p)`). The cleanest interpretation is therefore that the descriptive evidence suggests buffering, while the regression interaction remains too imprecise to confirm it strongly.
-
-```{r table_models}
-kable(
-  results_table,
-  align = c("l", "c", "c", "c"),
-  caption = "Table 1. Family fixed-effects models of log charitable giving."
-)
-```
-
-Notes: Entries are coefficients with clustered standard errors in parentheses. `+ p < 0.10`, `* p < 0.05`, `** p < 0.01`, `*** p < 0.001`. Age controls are included in Model 3 as a quadratic profile.
-
 ## Interpretation
 
-Taken together, the results support a cautious two-part conclusion. First, moving is consistently associated with lower charitable giving. Second, religiosity may soften that decline, but the strongest evidence for buffering comes from descriptive patterns rather than from a precisely estimated interaction in the fixed-effects models.
+First, moving is consistently associated with lower charitable giving. Religiosity may soften that decline, but the effect is not proven and would need further research.
 
-That distinction matters. The report can reasonably say that the evidence is consistent with a buffering role for religiosity, especially in the immediate period around a move, but it should stop short of claiming a definitive moderating effect.
+That distinction matters. We can reasonably say that the evidence is consistent with a buffering role for religiosity, especially in the immediate period around a move, but it should stop short of claiming a definitive effect.
+
 
 ## Limitations
 
+The results support a cautious two-part conclusion. First, moving is consistently associated with lower charitable giving. Second, religiosity may so
+
 - Religiosity is measured through reported religious preference, not through attendance, congregation membership, or religious intensity.
-- The move indicator is based on the PSID move-reason item and may not capture differences in move distance, disruption, or voluntariness.
+- The move indicator is based on the PSID move-reason item and does not capture differences in move distance, disruption, or voluntariness.
 - Many families move more than once, so the event-time figure uses a cleaner one-time-mover subsample for interpretability.
 - Missing donation responses are folded into the total-giving construction in a way that may understate true giving for some families.
 
 ## Conclusion
 
-The report finds clear evidence that moving is associated with lower charitable giving in the PSID family panel. It also finds descriptive evidence that families with pre-move religious affiliation experience a smaller immediate drop in giving after a move. However, the fixed-effects interaction estimates are not precise enough to treat that buffering pattern as definitive. The most accurate summary is that the results suggest, rather than prove, that religiosity may help families sustain charitable giving through residential disruption.
+The report finds some evidence that moving is associated with lower charitable giving in the PSID family panel. It also finds some descriptive evidence that families with pre-move religious affiliation experience a smaller immediate drop in giving after a move. However, the fixed-effects interaction estimates are not precise enough to treat that buffering pattern as definitive. The most accurate summary is that the results suggest, rather than prove, that religiosity may help families sustain charitable giving through residential disruption.
+
+
