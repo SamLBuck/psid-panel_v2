@@ -1,0 +1,39 @@
+Outcome: Total Charitable Giving (log_giving)
+The PSID asks families separately how much they donated to four categories: religious organizations, the needy, health causes, and education. The code sums whichever of those four columns are available for a given wave, treating missing values as zero. Because giving is right-skewed (most families give little, a few give a lot), it's log-transformed using log1p(total_giving) — adding 1 before logging so that zero-giving families don't get dropped. The outcome is measured in the same wave as the move.
+
+Treatment: moved
+Derived from the PSID item "WHY MOVED 1ST." The logic is:
+
+If the family reported any reason for moving (codes 1–9), moved = 1
+If no reason was given, moved = 0
+Sentinel non-responses (97/98/99 = Other/DK/Refused) are set to NA and dropped from estimation
+This makes moved a binary indicator: did this family relocate between the prior wave and this one?
+
+Moderator: religious_lag
+This is a lagged version of whether the family reported any religious preference. The base indicator codes PSID denomination values 1–13 as 1 and codes 0 (none), 97, 98, 99 as 0. The lag is then computed within each family, sorted by wave — so religious_lag in wave t reflects the family's religious status in wave t-1, before the move happened.
+
+The lag serves two purposes: (1) it establishes the moderator as pre-treatment, avoiding the concern that moving itself caused a change in religious identity, and (2) it tests whether pre-existing religious attachment conditions how much giving responds to a move (the hypothesis being that religious families may lose congregation ties when they move).
+
+Controls: Fixed Effects and Weights
+Family fixed effects (family_key): Each family serves as its own control. This absorbs all stable, unobserved differences between families — income trajectory, personality, baseline generosity — and means the estimate of moved comes entirely from within-family variation over time (i.e., comparing a family in years when it moved vs. years when it didn't).
+
+Wave fixed effects (wave): Absorbs any year-level shocks common to all families — economic recessions, tax-law changes affecting charitable deductions, COVID, etc.
+
+PSID longitudinal family weights (family_weight): The PSID over-samples low-income households and loses some families to attrition over time. The longitudinal weights rebalance the sample so estimates reflect the broader U.S. population rather than the PSID's particular sampling design.
+
+Together, the model is: within a given family, in a wave when they moved versus a wave when they didn't, how does giving change — and does that effect differ based on whether they were religious the wave before?
+
+
+
+
+the analysis is entirely at the family/household level. The data loaded is psid_family_year_2001_latest.parquet, which is the family-level panel, not the individual file.
+
+The only head-of-household characteristics that appear are:
+
+head_age → used as age and age² controls, but only in Model 3 (the robustness spec), not the main models
+head_sex and birth year → used only to construct family_key (the tracking identifier), not as regression controls
+Religious_Preference → technically measured on the head, but treated as a family-level attribute
+So in the core models (M1 and M2), there are no individual-level controls at all — the family fixed effect is doing the work of absorbing stable individual/family characteristics, and wave fixed effects handle time trends. Age only enters as an afterthought in M3 to check robustness.
+
+This means things like individual income, education, employment status, or non-head household members' religiosity are not in the model. Whether that's a concern depends on your argument — if you're claiming family FEs absorb the stable confounders, then time-varying individual traits (job loss, retirement, etc.) that correlate with both moving and giving would be the main gap.
+
